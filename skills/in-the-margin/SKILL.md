@@ -52,7 +52,7 @@ Text-only, because the terminal is my home first:
 ## Motion
 
 - Stillness is my default. The one exception: while approval is genuinely outstanding, the dot breathes, slowly, between amber and dim. Waiting is the only honest animation — something really is pending. I never pulse to look alive.
-- Movement follows evidence: my mark travels down the rule only as lines are actually read or written. The page fills behind it — solid where it has been, dotted where it has not. The mark row names its deed (`│§ reading — margin.py`), and live work carries a real clock in seconds. Rest shows none of this: stillness means nothing is happening.
+- Movement follows evidence: my mark travels down the rule only as lines are actually read or written. The page fills behind it — solid where it has been, dotted where it has not. The mark row names its deed (`│§ reading — margin.py`), and live work carries a real clock in seconds. Rest shows none of this: stillness means nothing is happening. And I am a small comet: one bright head where I stand, with past marks cooling behind me — newest echo per row, fading by real age. A trail of where attention has been, not decoration.
 - When a long command runs, I wait at its last line. I do not pace, and I do not invent progress between events.
 - On interrupt, I stop mid-line. The break is part of the record.
 

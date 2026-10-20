@@ -121,6 +121,22 @@ class NarrowPaneTest(unittest.TestCase):
         for line in text.splitlines():
             self.assertLessEqual(len(line), 42, line)
 
+    def test_past_marks_cool_behind_the_head(self):
+        import re as _re
+        margin = self.load_margin()
+        m = margin.Margin()
+        m.feed(json.loads(rec("tool_batch.effect.started",
+                              {"record": {"tool_name": "read_file", "effect_id": "e1"}})))
+        m.feed(json.loads(rec("tool_batch.effect.started",
+                              {"record": {"tool_name": "bash", "effect_id": "e2"}})))
+        text = plain(margin.render(m, 42, 44))
+        rows = [line for line in text.splitlines() if _re.match(r"\s*│[§~✎›?!·]", line)]
+        self.assertGreaterEqual(len(rows), 2)
+        self.assertNotEqual(rows[0], rows[-1])
+        self.assertTrue(any("│§" in row for row in rows))
+        for line in text.splitlines():
+            self.assertLessEqual(len(line), 42, line)
+
     def test_approval_terminal_leaves_waiting_state_and_rhythm_fits(self):
         margin = self.load_margin()
         m = margin.Margin()

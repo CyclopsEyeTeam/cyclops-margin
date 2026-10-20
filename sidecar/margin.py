@@ -74,6 +74,7 @@ class Margin:
         self.active = {}         # effect/call id -> tool name, for honest returns
         self.pending = {}        # effect/call id -> start-note text, collapsed on return
         self.stamps = []         # mark times, newest last, for the rhythm row
+        self.trail = []          # (page_pos, sigil, time), newest last: the comet's tail
         self.breathe = False     # approval-wait pulse phase; True only while genuinely waiting
         self.detail = ""         # what the mark is doing, e.g. the file it sits in
         self.state_since = time.time()  # when the current state began, for the live clock
@@ -89,6 +90,8 @@ class Margin:
         self.stale = False
         self.stamps.append(self.last_signal)
         self.stamps = self.stamps[-720:]
+        self.trail.append((self.page_pos, sigil, self.last_signal))
+        self.trail = self.trail[-24:]
 
     def set(self, sigil, state, colour, detail=""):
         self.sigil, self.state, self.colour = sigil, state, colour
@@ -176,6 +179,15 @@ def render(m, width, height):
     lines.append(f" {DIM}{m.model} · session {m.session} · {m.marks} marks observed{RESET}")
     lines.append("")
     pos = m.page_pos % page_rows if page_rows else 0
+    now = time.time()
+    # The comet's tail: past marks cooling where they stood. Newest echo
+    # per row wins; the head row is never overwritten. Fading is by real
+    # age — under ten seconds bright, older dim, nothing invented.
+    echoes = {}
+    for idx, sg, t in m.trail:
+        if idx == m.page_pos:
+            continue
+        echoes[idx % page_rows if page_rows else 0] = (sg, now - t)
     for i in range(page_rows):
         # The page fills as the mark descends: solid where it has been,
         # dotted where it has not. Honest position, not decoration.
@@ -183,6 +195,10 @@ def render(m, width, height):
         if i == pos:
             tag = f" {m.state}" + (f" — {m.detail}" if m.detail else "")
             lines.append(f"   {colour}│{sigil}{tag}{RESET} {colour}{rule}{RESET}")
+        elif i in echoes:
+            sg, echo_age = echoes[i]
+            fade = GREY if echo_age < 10 else DIM
+            lines.append(f"   {fade}│{sg}{RESET}  {DIM}{rule}{RESET}")
         else:
             lines.append(f"   {GREY}│{RESET}  {DIM}{rule}{RESET}")
     lines.append(f"   {GREY}│{RESET}")
