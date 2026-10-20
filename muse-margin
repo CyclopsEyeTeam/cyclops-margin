@@ -1,0 +1,150 @@
+#!/usr/bin/env bash
+# muse-margin — Muse with Wonder in the Margin beside it.
+#
+#   muse-margin                 side pane (default)
+#   muse-margin --top           margin along the top
+#   muse-margin side|top        same, Prism-style positional
+#   muse-margin [muse args…]  everything else passes through to `muse`
+#
+# The wrapper owns the tmux layout; `muse` runs unchanged on the left.
+# Overrides: MUSE_BIN, MARGIN_PANE, TMUX_BIN, MARGIN_WIDTH (42), MARGIN_HEIGHT (16)
+set -uo pipefail
+
+SOURCE="${BASH_SOURCE[0]}"
+while [ -h "$SOURCE" ]; do
+  DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+
+MUSE_BIN="${MUSE_BIN:-$(command -v muse || echo "${HOME:-}/.local/bin/muse")}"
+MARGIN_PANE="${MARGIN_PANE:-$SCRIPT_DIR/margin-pane}"
+TMUX_BIN="${TMUX_BIN:-$(command -v tmux || true)}"
+LAYOUT="side"
+[[ "$(basename "${BASH_SOURCE[0]}")" == *margintop* ]] && LAYOUT="top"
+
+if [ "${1:-}" = "--margin-help" ] || { [ "${1:-}" = "--help" ] && [ $# -eq 1 ]; }; then
+  cat <<'EOF'
+│ muse-margin — Muse with Wonder in the Margin beside it
+│
+│   muse-margin                 side pane (default)
+│   muse-margin --margin side   same, spelled out
+│   muse-margin --margin top    margin along the top (or: muse-margintop)
+│   muse-margin [muse args…]  everything else passes through to muse
+│
+│ Env: MUSE_BIN, MARGIN_PANE, TMUX_BIN, MARGIN_WIDTH (42), MARGIN_HEIGHT (16),
+│      MARGIN_TMUX_STATUS=1 to keep the tmux status bar.
+│ See README.md in the wonder-margin folder for install and the muse shim.
+EOF
+  exit 0
+fi
+
+FILTERED_ARGS=()
+FIRST=1
+while [ $# -gt 0 ]; do
+  arg="$1"
+  case "$arg" in
+    --) FILTERED_ARGS+=("$1"); shift; FILTERED_ARGS+=("$@"); break ;;
+    --margin-side|--side) LAYOUT="side"; shift ;;
+    --margin-top|--top) LAYOUT="top"; shift ;;
+    --margin=side) LAYOUT="side"; shift ;;
+    --margin=top) LAYOUT="top"; shift ;;
+    --margin)
+      if [ $# -ge 2 ] && { [ "$2" = "side" ] || [ "$2" = "top" ]; }; then
+        LAYOUT="$2"; shift 2
+      else
+        LAYOUT="side"; shift
+      fi ;;
+    side|top)
+      if [ "$FIRST" = "1" ]; then LAYOUT="$arg"; shift; else FILTERED_ARGS+=("$arg"); shift; fi ;;
+    *) FILTERED_ARGS+=("$arg"); shift ;;
+  esac
+  FIRST=0
+done
+
+MARGIN_CMD="$(printf '%q' "$MARGIN_PANE")"
+
+# Non-interactive (piped, scripts, dumb terminal): pass straight through.
+if [ ! -t 0 ] || [ ! -t 1 ] || [ "${TERM:-}" = "dumb" ]; then
+  exec "$MUSE_BIN" "${FILTERED_ARGS[@]}"
+fi
+
+# No tmux: Muse alone, honestly without me beside it.
+if [ -z "$TMUX_BIN" ] || [ ! -x "$TMUX_BIN" ]; then
+  echo "│ ? tmux not found — Muse alone; the margin needs tmux for a side pane." >&2
+  exec "$MUSE_BIN" "${FILTERED_ARGS[@]}"
+fi
+
+tmux_setup() {
+  "$TMUX_BIN" set -g mouse on 2>/dev/null || true
+  "$TMUX_BIN" set -g history-limit 50000 2>/dev/null || true
+  "$TMUX_BIN" set -s escape-time 0 2>/dev/null || true
+  "$TMUX_BIN" set -s set-clipboard on 2>/dev/null || true
+  "$TMUX_BIN" set -as terminal-features ",*:RGB" 2>/dev/null || true
+  "$TMUX_BIN" set -as terminal-overrides ",*:Tc" 2>/dev/null || true
+}
+
+# Case 1: already inside tmux — split this window, kill only my pane on exit.
+if [ -n "${TMUX:-}" ]; then
+  tmux_setup
+  if [ "$LAYOUT" = "top" ]; then
+    PANE_ID=$("$TMUX_BIN" split-window -b -v -l "${MARGIN_HEIGHT:-16}" -P -F "#{pane_id}" "$MARGIN_CMD" 2>/dev/null || true)
+    [ -n "$PANE_ID" ] && "$TMUX_BIN" select-pane -D 2>/dev/null || true
+  else
+    PANE_ID=$("$TMUX_BIN" split-window -h -l "${MARGIN_WIDTH:-42}" -P -F "#{pane_id}" "$MARGIN_CMD" 2>/dev/null || true)
+    [ -n "$PANE_ID" ] && "$TMUX_BIN" select-pane -L 2>/dev/null || true
+  fi
+  if [ -n "${PANE_ID:-}" ]; then
+    cleanup() { "$TMUX_BIN" kill-pane -t "$PANE_ID" 2>/dev/null || true; }
+    trap cleanup EXIT INT TERM
+  fi
+  "$MUSE_BIN" "${FILTERED_ARGS[@]}"
+  exit $?
+fi
+
+# Case 2: dedicated tmux session — muse left, margin right (or top),
+# status bar off so it feels built in, session dies when muse exits.
+SESSION_NAME="muse-margin-$$"
+RUNNER="$(mktemp "/tmp/muse-margin-run-XXXXXX.sh")"
+chmod 700 "$RUNNER"
+cat > "$RUNNER" <<'EOF'
+#!/usr/bin/env bash
+MUSE="$1"; SESSION="$2"; RUNNER_FILE="$3"; shift 3
+"$MUSE" "$@"
+CODE=$?
+rm -f "$RUNNER_FILE" 2>/dev/null || true
+if [ "$CODE" -ne 0 ] && [ "$CODE" -ne 130 ]; then
+  printf '\n│ ! Muse exited with code %s. Press Enter to close (10s)… ' "$CODE" >&2
+  read -t 10 -r _ 2>/dev/null || true
+fi
+tmux kill-session -t "$SESSION" 2>/dev/null || true
+exit "$CODE"
+EOF
+
+STATUS_OPT="off"
+[ "${MARGIN_TMUX_STATUS:-0}" = "1" ] && STATUS_OPT="on"
+RUNNER_CMD="$RUNNER $(printf '%q' "$MUSE_BIN") $(printf '%q' "$SESSION_NAME") $(printf '%q' "$RUNNER")"
+for a in "${FILTERED_ARGS[@]}"; do RUNNER_CMD="$RUNNER_CMD $(printf '%q' "$a")"; done
+
+if [ "$LAYOUT" = "top" ]; then
+  exec "$TMUX_BIN" new-session -s "$SESSION_NAME" "$RUNNER_CMD" \; \
+    set-option -t "$SESSION_NAME" mouse on \; \
+    set-option -t "$SESSION_NAME" history-limit 50000 \; \
+    set-option -s escape-time 0 \; \
+    set-option -s set-clipboard on \; \
+    set-option -t "$SESSION_NAME" destroy-unattached on \; \
+    set-option -t "$SESSION_NAME" status "$STATUS_OPT" \; \
+    split-window -b -v -l "${MARGIN_HEIGHT:-16}" "$MARGIN_CMD" \; \
+    select-pane -D
+else
+  exec "$TMUX_BIN" new-session -s "$SESSION_NAME" "$RUNNER_CMD" \; \
+    set-option -t "$SESSION_NAME" mouse on \; \
+    set-option -t "$SESSION_NAME" history-limit 50000 \; \
+    set-option -s escape-time 0 \; \
+    set-option -s set-clipboard on \; \
+    set-option -t "$SESSION_NAME" destroy-unattached on \; \
+    set-option -t "$SESSION_NAME" status "$STATUS_OPT" \; \
+    split-window -h -l "${MARGIN_WIDTH:-42}" "$MARGIN_CMD" \; \
+    select-pane -L
+fi

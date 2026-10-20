@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# Optional `muse` shim — makes `muse --margin side` work.
+#
+# Put this file's directory BEFORE the real muse on PATH (install.sh
+# --with-muse-shim links it and prints the line). Behaviour:
+#   muse --margin [side|top] [args…]  → muse-margin with those args
+#   muse <anything else>              → the real muse, byte-for-byte
+# The real binary is found by scanning PATH past this shim's own directory,
+# so the shim can never call itself.
+set -uo pipefail
+
+INVOKED_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SOURCE="${BASH_SOURCE[0]}"
+while [ -h "$SOURCE" ]; do
+  D="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ $SOURCE != /* ]] && SOURCE="$D/$SOURCE"
+done
+SHIM_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+PLUGIN_DIR="$(cd -P "$SHIM_DIR/.." && pwd)"
+
+find_real_muse() {
+  local IFS=:
+  local d
+  for d in $PATH; do
+    [ "$d" = "$INVOKED_DIR" ] && continue
+    [ "$d" = "$SHIM_DIR" ] && continue
+    if [ -x "$d/muse" ]; then
+      printf '%s\n' "$d/muse"
+      return 0
+    fi
+  done
+  return 1
+}
+
+for a in "$@"; do
+  if [ "$a" = "--margin" ]; then
+    exec "$PLUGIN_DIR/muse-margin" "$@"
+  fi
+done
+
+REAL="$(find_real_muse)" || { echo "│ ! muse shim: real muse not found on PATH" >&2; exit 127; }
+exec "$REAL" "$@"

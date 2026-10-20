@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 1,
+  "name": "wonder-margin",
+  "displayName": "Wonder — Muse in the Margin",
+  "version": "0.1.0",
+  "description": "Wonder, Muse Code's own terminal presence: a living margin that annotates only what it has observed.",
+  "compat": {
+    "source": "native",
+    "manifestDir": ".muse-plugin"
+  },
+  "capabilities": {
+    "skills": [
+      {
+        "id": "in-the-margin",
+        "path": "skills/in-the-margin/SKILL.md",
+        "enabledDefault": true
+      }
+    ],
+    "commands": [
+      {
+        "id": "margin",
+        "path": "commands/margin.md",
+        "enabledDefault": true
+      }
+    ],
+    "hooks": [],
+    "mcpServers": [],
+    "reminders": []
+  }
+}

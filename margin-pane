@@ -1,0 +1,5 @@
+#!/bin/sh
+# Wonder in the Margin — sidecar pane launcher.
+# Run in a split/second terminal beside `muse`:
+#   /path/to/wonder-margin/margin-pane
+exec python3 "$(dirname "$0")/sidecar/margin.py" "$@"
