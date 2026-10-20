@@ -22,8 +22,8 @@ mark at a time:
 
  ── annotations (newest last) ──
   │· session opened — present, nothing claimed
-  │§ reading — read_skill
-  │~ bash returned (completed)
+  │§ margin.py closed (completed)
+  │~ bash back (completed)
 ```
 
 - `§` reading · `~` working · `✎` editing · `›` attending/responding
