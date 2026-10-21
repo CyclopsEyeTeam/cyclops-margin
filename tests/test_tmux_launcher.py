@@ -17,7 +17,15 @@ os.environ["TMUX_TMPDIR"] = TEST_TMPDIR  # isolated server; never the user's
 
 
 def tmux(*args, **kw):
-    return subprocess.run(["tmux", *args], capture_output=True, text=True, timeout=20, **kw)
+    # Never touch the ambient server: inside a tmux client $TMUX overrides
+    # $TMUX_TMPDIR, so without this `kill-server` in tearDown would take
+    # down the very terminal the tests were launched from. Every command
+    # here targets the isolated server in TEST_TMPDIR only.
+    env = dict(kw.pop("env", None) or os.environ)
+    env.pop("TMUX", None)
+    env.pop("TMUX_PANE", None)
+    return subprocess.run(["tmux", *args], capture_output=True, text=True,
+                          timeout=20, env=env, **kw)
 
 
 @unittest.skipUnless(shutil.which("tmux"), "tmux unavailable")

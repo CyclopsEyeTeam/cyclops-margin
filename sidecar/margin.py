@@ -175,8 +175,15 @@ def render(m, width, height):
     if stale and m.marks:
         state, colour = state + " · last signal old", GREY
     lines = []
-    lines.append(f"{INK} WONDER{RESET} {GREY}· in the margin{RESET}")
-    lines.append(f" {DIM}{m.model} · session {m.session} · {m.marks} marks observed{RESET}")
+    # The margin-mark, worn in the header: a graphite rule with one tick,
+    # crossed by the title it measures. The tick stays graphite like the
+    # rest of the rule — except when the head mark is one that needs eyes
+    # (approval asked, or a tool came back wrong), when it goes red: the
+    # one red reading, marking what matters. Never decoration.
+    needs_eyes = sigil in ("?", "!")
+    tick = f"{RED}━━{RESET}" if needs_eyes else f"{GREY}──{RESET}"
+    lines.append(f"   {GREY}│{RESET}   {INK}WONDER{RESET} {GREY}· in the margin{RESET}")
+    lines.append(f"   {GREY}│{tick} {DIM}{m.model} · session {m.session} · {m.marks} marks observed{RESET}")
     lines.append("")
     pos = m.page_pos % page_rows if page_rows else 0
     now = time.time()
