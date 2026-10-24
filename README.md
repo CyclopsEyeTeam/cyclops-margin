@@ -48,7 +48,7 @@ mark at a time:
 ## Install
 
 Requirements: Muse Code (`muse`), Python 3, and `tmux` for the side pane
-(Linux/macOS terminal).
+(Linux terminal; macOS is expected to work but is untested).
 
 ```sh
 git clone https://github.com/CyclopsEyeTeam/cyclops-margin.git
@@ -57,8 +57,12 @@ cd cyclops-margin
 ```
 
 The installer validates the plugin, installs it with Muse at user scope,
-and links `muse-margin` into `~/.local/bin`. It never modifies the `muse`
-binary.
+and links `muse-margin`, `margin-pane` and `margin-keep` into `~/.local/bin`.
+It never modifies the `muse` binary. **Keep this folder where it is after
+installing** — the PATH links and the installed plugin point into this
+checkout, so moving or deleting it breaks the install until you re-run
+`./install.sh` from its new home. The installer refuses to overwrite any
+same-named file or symlink that is not already Wonder's.
 
 ## Use
 
@@ -72,9 +76,15 @@ muse-margin --top      # Wonder along the top — or just: muse-margintop
 That is the whole interface. Muse runs unchanged; the tmux layout around it
 is what makes Wonder look built in (status bar off, side pane 42 cells —
 `MARGIN_WIDTH`, `MARGIN_TMUX_STATUS=1` if you want the bar back). Already
-inside tmux? It splits your current window and removes only its own pane when
-you exit. Piped/non-interactive calls pass straight through. In a short top
-pane Wonder takes a compact running-head form, so the status line survives.
+inside tmux? It splits your current window, removes only its own pane when
+you exit, and restores your session's mouse/history settings as it found
+them; if the pane cannot open it says so instead of starting silently
+marginless. No tmux option is ever set server-wide. Piped/non-interactive
+calls pass straight through. In a short top pane Wonder takes a compact
+running-head form, so the status line survives. The dedicated-session
+launcher runs Muse through a short-lived runner file in `/tmp` (mode 700,
+self-deleting; it embeds your Muse arguments, so a hard-killed session
+can leave one behind — delete any stale `/tmp/muse-margin-run-*.sh`).
 
 Inside the Muse pane, `/margin` summons Wonder's voice, and asking for
 Wonder in the terminal loads the same skill (`plugin:wonder-margin:in-the-margin`).

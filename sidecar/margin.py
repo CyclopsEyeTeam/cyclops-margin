@@ -23,7 +23,7 @@ form for short top panes. Plus one button: `[ ⧉ copy my last message ]`
 held for copying and never rendered; the button says `copied` only when a
 local clipboard tool exited cleanly, else `copy sent` for OSC52.
 """
-import argparse, base64, glob, json, os, re, select, shutil, subprocess, sys, time
+import argparse, base64, glob, json, os, re, select, shutil, subprocess, sys, time, unicodedata
 
 try:
     import termios, tty
@@ -32,6 +32,27 @@ except ImportError:  # non-POSIX: the pane still renders, just no clicks
 
 ANSI_RE = re.compile(r"\033\[[0-9;]*m")
 MOUSE_RE = re.compile(r"\033\[<(\d+);(\d+);(\d+)([Mm])")
+CSI_RE = re.compile(r"\033\[[0-9;?]*[A-Za-z~]")
+ESC_RE = re.compile(r"\033.")
+PASTE_RE = re.compile(r"\033\[200~[\s\S]*?(?:\033\[201~|$)")
+CTRL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+def clean(text):
+    """Strip control characters from host-supplied text before rendering.
+
+    A kept line or a logged subject is data, never terminal control: an
+    escape in it would let the log draw marks the pane has no right to
+    draw. The `✓` glyph is also removed — it is Wonder's earned mark,
+    earned only in voice, and untrusted text may not borrow it.
+    """
+    return CTRL_RE.sub("", str(text)).replace("✓", "")
+
+def cell_width(ch):
+    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+
+def display_width(text):
+    """Visible cells of a string, ignoring ANSI escapes, wide chars = 2."""
+    return sum(cell_width(ch) for ch in ANSI_RE.sub("", text))
 
 def clip(text, width):
     """Truncate by visible cells, keeping ANSI escapes intact."""
@@ -40,13 +61,16 @@ def clip(text, width):
         m = ANSI_RE.match(text, i)
         if m:
             out.append(m.group(0)); i = m.end(); continue
-        out.append(text[i]); visible += 1; i += 1
+        w = cell_width(text[i])
+        if visible + w > width:
+            break
+        out.append(text[i]); visible += w; i += 1
     if ANSI_RE.search(text):
         out.append(RESET)
     return "".join(out)
 
 GREY = "\033[90m"; DIM = "\033[2m"; INK = "\033[1;97m"
-GREEN = "\033[32m"; AMBER = "\033[33m"; RED = "\033[31m"; RESET = "\033[0m"
+AMBER = "\033[33m"; RED = "\033[31m"; RESET = "\033[0m"
 REV = "\033[7m"  # reverse video: the copy button, pressed
 READ_TOOLS = {"read_file", "read_skill", "search", "read_memory", "web_fetch", "web_search",
               "subagent_status", "subagent_read_result", "work_list", "work_status",
@@ -70,7 +94,7 @@ def subject_short(record, tool):
     name = subj.split(":", 1)[-1].rsplit("/", 1)[-1] if subj else ""
     if not name and tool.startswith("mcp__"):
         name = tool.rsplit("__", 1)[-1]  # mcp__server__room_read -> room_read
-    return name or tool
+    return clean(name or tool)
 
 
 def event_time(record):
@@ -111,7 +135,7 @@ class Margin:
         self.last_signal = time.time()
         self.session = "—"
         self.model = "muse-wonder-full-1.0"
-        self.stale = False
+        self.ended = False       # this session's end was observed (adoption gate)
         self.active = {}         # effect/call id -> tool name, for honest returns
         self.pending = {}        # effect/call id -> start-note text, collapsed on return
         self.stamps = []         # mark times, newest last, for the rhythm row
@@ -142,7 +166,7 @@ class Margin:
         if self._kept_cache[0] != mtime:
             try:
                 with open(self.kept_path, encoding="utf-8", errors="ignore") as f:
-                    text = next((ln.strip() for ln in f if ln.strip()), "")
+                    text = next((clean(ln.strip()) for ln in f if ln.strip()), "")
             except OSError:
                 text = ""
             self._kept_cache = (mtime, text)
@@ -152,14 +176,16 @@ class Margin:
         return self._at if self._at is not None else time.time()
 
     def note(self, sigil, colour, text):
-        if self.notes and self.notes[-1][2] == text:
-            return
-        self.notes.append((sigil, colour, text))
-        self.notes = self.notes[-5:]
+        text = clean(text)
+        # An identical consecutive note is displayed once (parallel calls to
+        # the same file read as one mark on the page) — but the event was
+        # still observed, so it still counts below.
+        if not (self.notes and self.notes[-1][2] == text):
+            self.notes.append((sigil, colour, text))
+            self.notes = self.notes[-5:]
         self.marks += 1
         self.page_pos += 1
         self.last_signal = self._now()
-        self.stale = False
         self.stamps.append(self.last_signal)
         self.stamps = self.stamps[-720:]
         self.trail.append((self.page_pos, sigil, self.last_signal))
@@ -167,7 +193,7 @@ class Margin:
 
     def set(self, sigil, state, colour, detail=""):
         self.sigil, self.state, self.colour = sigil, state, colour
-        self.detail = detail
+        self.detail = clean(detail)
         self.state_since = self._now()
 
     def feed(self, rec):
@@ -182,18 +208,21 @@ class Margin:
             self.set("·", "resting", GREY); self.note("·", GREY, "session opened — present, nothing claimed")
         elif pt == "session.end":
             reason = (pl.get("record") or {}).get("exit_reason") or "ended"
+            self.ended = True
             self.set("·", f"ended ({reason})", GREY)
             self.note("·", GREY, f"session ended ({reason}) — marks left as they stand")
         elif pt == "run.model.configured":
             label = (pl.get("record") or {}).get("display_label")
-            if label: self.model = label
+            if label: self.model = clean(label)
         elif pt == "runtime.user_intent.accepted":
             self.set("›", "attending", INK); self.note("›", INK, "prompt received (text never shown here)")
         elif pt == "approval_wait.effect.started":
             tool = (pl.get("record") or {}).get("tool_name", "a tool")
-            self.tally["waited"] += 1
             self.set("?", "waiting for approval", AMBER); self.note("?", AMBER, f"approval asked — {tool} held")
         elif pt == "approval_wait.effect.terminal":
+            # The tally counts deeds that returned; the wait returns here,
+            # not when it was asked.
+            self.tally["waited"] += 1
             outcome = ((pl.get("record") or {}).get("outcome") or {}).get("kind", "settled")
             self.set("›", "attending", INK); self.note("›", INK, f"approval {outcome}")
         elif pt == "subagent.control.spawn_accepted":
@@ -240,18 +269,29 @@ class Margin:
         elif pt == "tool_batch.effect.terminal":
             r = pl.get("record") or {}
             keys = [r.get("effect_id"), r.get("call_id")]
-            tool = r.get("tool_name") or self.active.pop(keys[0], None) or self.active.pop(keys[1], None) or "tool"
+            # Both id keys are always retired, tool_name or not: leaving one
+            # behind leaks an entry per tool call for the pane's whole life.
+            tool = r.get("tool_name")
             started = verb = short = None
             for key in keys:
-                if key and key in self.pending:
+                if not key:
+                    continue
+                known = self.active.pop(key, None)
+                if tool is None:
+                    tool = known
+                if key in self.pending:
                     started, verb, short = self.pending.pop(key)
+            tool = tool or "tool"
+            observed = started is not None  # a start was actually seen
             out = r.get("outcome") or {}
             outcome = (out.get("kind") or "returned").lower()
             # The honest verdict can hide one level down: a "completed"
             # wrapper around a failed/cancelled terminal is still a
             # failure/interrupt, and is reported as one.
             nested = (((out.get("task_completion") or {}).get("terminal") or {}).get("kind") or "").lower()
-            if started:
+            # Retire the start note only when no sibling call with the same
+            # text is still running (parallel calls share one display note).
+            if started and not any(v[0] == started for v in self.pending.values()):
                 self.notes = [n for n in self.notes if n[2] != started]
             disp = tool.rsplit("__", 1)[-1] if tool.startswith("mcp__") else tool
             if "fail" in outcome or "error" in outcome or nested == "failed":
@@ -259,12 +299,17 @@ class Margin:
                 self.set("!", "a tool reported a problem", RED); self.note("!", RED, f"{disp} came back wrong: {shown}")
             elif outcome == "cancelled" or nested == "cancelled":
                 self.set("—", "interrupted", AMBER); self.note("—", AMBER, f"{disp} interrupted (cancelled)")
+            elif not observed:
+                # A terminal whose start was never seen (the tail window cut
+                # between them) proves a return, not a deed: no tally stroke
+                # is invented for work the pane did not watch begin.
+                self.note("~", GREY, f"{disp} returned ({outcome})")
             else:
                 # A return is a return — never a success verdict. It replaces
                 # its start note, so one tool leaves one line, not two. Each
                 # kind of work gets its own closing voice; the outcome in
                 # brackets stays literal, never dressed up. Only a clean
-                # return earns a tally stroke.
+                # return of an observed start earns a tally stroke.
                 if verb == "reading":
                     self.tally["read"] += 1
                     self.note("§", GREY, f"{short or tool} closed ({outcome})")
@@ -272,8 +317,10 @@ class Margin:
                     self.tally["edited"] += 1
                     self.note("✎", GREY, f"{short or tool} marked ({outcome})")
                 elif verb == "branching":
-                    self.tally["branched"] += 1
-                    self.note("⌥", GREY, f"branch back ({outcome})")
+                    # The spawn call returning only opens the branch; the
+                    # branch itself returns via result_ready / workflow-child
+                    # completion. Counting both would count one branch twice.
+                    self.note("⌥", GREY, f"branch call back ({outcome})")
                 elif verb == "watching":
                     self.note("~", GREY, f"{disp} watch ended ({outcome})")
                 else:
@@ -327,16 +374,25 @@ def do_copy(m, deliver=None, emit=None):
 
 def parse_input(data):
     """Terminal input -> intent. SGR mouse presses (not releases, not
-    motion), `c`/`y` to copy, Ctrl-C / `q` to leave. 1-based cells."""
+    motion); a lone `c`/`y` copies, lone Ctrl-C / `q` leaves. 1-based cells.
+
+    Everything else is inert: escape sequences (arrow keys carry a literal
+    `C`) are stripped whole, bracketed-paste content is dropped whole, and
+    a multi-character burst is text, not keys — pasting a sentence that
+    happens to contain c or q must never copy or quit.
+    """
     events = []
     for b, x, y, final in MOUSE_RE.findall(data):
         if final == "M" and not (int(b) & 32) and int(b) & 3 != 3:
             events.append(("click", int(x), int(y)))
     rest = MOUSE_RE.sub("", data)
-    for ch in rest:
-        if ch in "cCyY":
+    rest = PASTE_RE.sub("", rest)
+    rest = CSI_RE.sub("", rest)
+    rest = ESC_RE.sub("", rest)
+    if len(rest) == 1:
+        if rest in "cCyY":
             events.append(("copy",))
-        elif ch in ("\x03", "q", "Q"):
+        elif rest in ("\x03", "q", "Q"):
             events.append(("quit",))
     return events
 
@@ -440,7 +496,11 @@ def render(m, width, height):
     btn = f"[ {label} ]"
     hint = f" {DIM}(click or c){RESET}" if 1 + len(btn) + 13 <= width else ""
     lines.append(f" {btn_colour}{btn}{RESET}{hint}")
-    m.button = (len(lines) - 1, 1, len(btn))
+    # Hit-box matches what is actually drawn: the line is clipped to the
+    # pane width below, so the box ends at the clipped edge, never past it.
+    drawn = clip(lines[-1], width)
+    m.button = (len(lines) - 1, 1,
+                max(1, min(display_width(btn), display_width(drawn) - 1)))
     # A line kept is kept on purpose, in a file, across sessions
     # (margin-keep). No file, no box — the newest note is not dressed up
     # as something cherished.
@@ -472,27 +532,49 @@ def term_size():
         return 48, 44
 
 def load_tail(m, path):
-    m.session = os.path.basename(os.path.dirname(path))[:8] or m.session
+    """Feed the tail and return the byte offset actually consumed.
+
+    The caller follows from this offset, not from a later getsize():
+    anything written between the read and a size check would be skipped.
+    Returns 0 when the log cannot be read.
+    """
+    m.session = clean(os.path.basename(os.path.dirname(path))[:8]) or m.session
     try:
         with open(path, encoding="utf-8", errors="ignore") as f:
             tail = f.readlines()[-3000:]
+            offset = f.tell()
         for line in tail:
             try: m.feed(json.loads(line))
             except Exception: pass
         m.page_pos = max(0, m.marks - 1)
+        return offset
     except OSError:
-        pass
+        return 0
+
+
+def should_adopt(current_ended, current_age_s, newer_age_s):
+    """Whether the pane may leave its session for a newer one.
+
+    A live session is never stolen: two concurrent `muse` sessions would
+    otherwise flip the pane between them, discarding its tally and held
+    answer on every switch. Adoption needs the current session ended, or
+    quiet for five minutes while the other is active.
+    """
+    if current_ended:
+        return True
+    return current_age_s > 300 and newer_age_s < current_age_s
 
 def follow(path, once=False, pinned=False):
     m = Margin()
     # Populate from the tail so a pane opened mid-session is not empty.
-    load_tail(m, path)
+    # The follow offset is what the tail read consumed — never a later
+    # getsize(), which would skip events written in between.
+    offset = load_tail(m, path)
     if once:
         cols, rows = term_size()
         sys.stdout.write(render(m, cols, rows) + "\n")
         return
     sys.stdout.write("\033[?25l\033[2J")
-    offset = os.path.getsize(path)
     last_draw = ""
     last_check = 0.0
     last_breathe = 0.0
@@ -504,23 +586,31 @@ def follow(path, once=False, pinned=False):
         try:
             old_tty = termios.tcgetattr(sys.stdin.fileno())
             tty.setcbreak(sys.stdin.fileno())
-            sys.stdout.write("\033[?1000h\033[?1006h")
+            # Mouse + bracketed paste: paste arrives wrapped, so its text
+            # can be dropped whole instead of read as keystrokes.
+            sys.stdout.write("\033[?1000h\033[?1006h\033[?2004h")
             sys.stdout.flush()
         except Exception:
             interactive, old_tty = False, None
     try:
         while True:
             # Unless pinned to one log, adopt a newer session when one starts
-            # (the pane is usually launched at the same moment as `muse`).
+            # (the pane is usually launched at the same moment as `muse`) —
+            # but never steal a live session: a second concurrent `muse`
+            # must not flip the pane back and forth, dropping its tally.
             if not pinned and time.time() - last_check > 2:
                 last_check = time.time()
                 newer = newest_session()
                 if newer and newer != path:
-                    path = newer
-                    m = Margin()
-                    load_tail(m, path)
-                    try: offset = os.path.getsize(path)
-                    except OSError: offset = 0
+                    try:
+                        ages = (time.time() - os.path.getmtime(path),
+                                time.time() - os.path.getmtime(newer))
+                    except OSError:
+                        ages = (0.0, 0.0)
+                    if should_adopt(m.ended, ages[0], ages[1]):
+                        path = newer
+                        m = Margin()
+                        offset = load_tail(m, path)
             try:
                 cols, rows = term_size()
                 with open(path, encoding="utf-8", errors="ignore") as f:
@@ -563,7 +653,7 @@ def follow(path, once=False, pinned=False):
         pass
     finally:
         if interactive:
-            sys.stdout.write("\033[?1006l\033[?1000l")
+            sys.stdout.write("\033[?2004l\033[?1006l\033[?1000l")
         if old_tty is not None:
             try: termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old_tty)
             except Exception: pass

@@ -33,11 +33,11 @@ find_real_muse() {
   return 1
 }
 
-for a in "$@"; do
-  if [ "$a" = "--margin" ]; then
-    exec "$PLUGIN_DIR/muse-margin" "$@"
-  fi
-done
+# `--margin` is intercepted in first position only. Anywhere else it is
+# Muse's own argument (e.g. a value to a subcommand) and forwards as-is.
+if [ "${1:-}" = "--margin" ]; then
+  exec "$PLUGIN_DIR/muse-margin" "$@"
+fi
 
 REAL="$(find_real_muse)" || { echo "│ ! muse shim: real muse not found on PATH" >&2; exit 127; }
 exec "$REAL" "$@"

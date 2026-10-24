@@ -39,6 +39,17 @@ class MarginKeepTest(unittest.TestCase):
         self.assertFalse(os.path.exists(self.path))
         self.assertIn("nothing kept", self.run_keep())
 
+    def test_newlines_flatten_and_blank_is_refused(self):
+        out = self.run_keep("line1\nline2")
+        self.assertIn("line1 line2", out)
+        with open(self.path, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "line1 line2\n")
+        r = subprocess.run([KEEP, "   "], capture_output=True, text=True,
+                           env=self.env, timeout=20)
+        self.assertNotEqual(r.returncode, 0)
+        with open(self.path, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "line1 line2\n")  # refusal kept the old line
+
 
 if __name__ == "__main__":
     unittest.main()

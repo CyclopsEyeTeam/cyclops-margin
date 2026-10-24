@@ -179,11 +179,14 @@ class SecondSittingTest(unittest.TestCase):
         self.assertEqual((m.sigil, m.state), ("⌥", "branching"))
         self.feed(m, "tool_batch.effect.terminal",
                   {"record": {"effect_id": "b1", "outcome": {"kind": "completed"}}})
-        self.assertIn("branch back (completed)", [t for _, _, t in m.notes])
+        # The spawn call returning only opens the branch; it is not the
+        # branch back, and earns no tally stroke of its own.
+        self.assertIn("branch call back (completed)", [t for _, _, t in m.notes])
+        self.assertEqual(m.tally["branched"], 0)
         self.feed(m, "subagent.control.spawn_accepted", {"record": {}})
         self.feed(m, "subagent.control.result_ready", {"record": {}})
         self.assertIn("branch back — subagent result ready", [t for _, _, t in m.notes])
-        self.assertEqual(m.tally["branched"], 2)
+        self.assertEqual(m.tally["branched"], 1)  # one branch, counted once
 
     def test_workflow_child_edges_only(self):
         mod = self.load_margin(); m = self.fresh(mod)
@@ -376,6 +379,146 @@ class CopyButtonTest(unittest.TestCase):
         self.assertLessEqual(len(text.splitlines()), 16)
         for line in text.splitlines():
             self.assertLessEqual(len(line), 42, line)
+
+
+class ReviewFixTest(unittest.TestCase):
+    """Regressions from the 2026-10-24 fresh-eyes review of this pane."""
+
+    def load_margin(self):
+        spec = importlib.util.spec_from_file_location("margin", SCRIPT)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def fresh(self, mod):
+        return mod.Margin(kept_path=os.path.join(tempfile.gettempdir(),
+                                                  "wonder-no-such-kept.txt"))
+
+    def feed(self, m, pt, payload):
+        m.feed(json.loads(rec(pt, payload)))
+
+    def cycle(self, m, tool, eid, terminal_tool=True):
+        self.feed(m, "tool_batch.effect.started",
+                  {"record": {"tool_name": tool, "effect_id": eid, "call_id": eid + "c"}})
+        term = {"effect_id": eid, "call_id": eid + "c", "outcome": {"kind": "completed"}}
+        if terminal_tool:
+            term["tool_name"] = tool
+        self.feed(m, "tool_batch.effect.terminal", {"record": term})
+
+    def test_arrows_paste_and_bursts_are_inert(self):
+        mod = self.load_margin()
+        self.assertEqual(mod.parse_input("\x1b[C"), [])        # Right arrow
+        self.assertEqual(mod.parse_input("\x1b[1;5C"), [])     # Ctrl-Right
+        self.assertEqual(mod.parse_input("code it, quickly"), [])
+        self.assertEqual(mod.parse_input("\x1b[200~q\x1b[201~"), [])  # bracketed paste
+        self.assertEqual(mod.parse_input("cq"), [])            # burst, not keys
+        self.assertEqual(mod.parse_input("c"), [("copy",)])
+        self.assertEqual(mod.parse_input("q"), [("quit",)])
+        self.assertEqual(mod.parse_input("\x1b[<0;5;3M"), [("click", 5, 3)])
+
+    def test_active_map_does_not_leak(self):
+        mod = self.load_margin(); m = self.fresh(mod)
+        for i in range(5):
+            self.cycle(m, "bash", f"e{i}", terminal_tool=True)
+        self.assertEqual((len(m.active), len(m.pending)), (0, 0))
+        for i in range(5):
+            self.cycle(m, "bash", f"f{i}", terminal_tool=False)
+        self.assertEqual((len(m.active), len(m.pending)), (0, 0))
+
+    def test_untrusted_text_cannot_inject_escapes_or_the_tick(self):
+        mod = self.load_margin()
+        with tempfile.TemporaryDirectory() as d:
+            kept = os.path.join(d, "kept.txt")
+            with open(kept, "w", encoding="utf-8") as f:
+                f.write("\x1b[31mINJECTED \x1b[32m✓\n")
+            m = mod.Margin(kept_path=kept)
+            frame = mod.render(m, 42, 44)
+            self.assertNotIn("\x1b[31mINJECTED", frame)
+            self.assertNotIn("✓", plain(frame))
+            self.assertIn("INJECTED", plain(frame))  # words stay, control goes
+        m2 = self.fresh(mod)
+        self.feed(m2, "tool_batch.effect.started",
+                  {"record": {"tool_name": "read_file", "effect_id": "x1",
+                              "parallel_profile": {"subject": "workspace:\x1b[32m✓evil.py"}}})
+        self.assertNotIn("✓", plain(mod.render(m2, 42, 44)))
+        self.assertNotIn("\x1b[32m✓", "".join(t for _, _, t in m2.notes))
+
+    def test_parallel_same_file_calls_are_two_deeds(self):
+        mod = self.load_margin(); m = self.fresh(mod)
+        subj = {"subject": "workspace:a/same.py"}
+        for eid in ("p1", "p2"):
+            self.feed(m, "tool_batch.effect.started",
+                      {"record": {"tool_name": "read_file", "effect_id": eid,
+                                  "parallel_profile": subj}})
+        texts = [t for _, _, t in m.notes]
+        self.assertEqual(texts.count("reading — same.py"), 1)  # one display mark
+        self.assertEqual(m.marks, 2)                            # two deeds seen
+        self.feed(m, "tool_batch.effect.terminal",
+                  {"record": {"effect_id": "p1", "outcome": {"kind": "completed"}}})
+        self.assertIn("reading — same.py", [t for _, _, t in m.notes])  # sibling still runs
+        self.assertEqual(m.tally["read"], 1)
+        self.feed(m, "tool_batch.effect.terminal",
+                  {"record": {"effect_id": "p2", "outcome": {"kind": "completed"}}})
+        self.assertNotIn("reading — same.py", [t for _, _, t in m.notes])
+        self.assertEqual(m.tally["read"], 2)
+
+    def test_orphan_terminal_invents_no_deed(self):
+        mod = self.load_margin(); m = self.fresh(mod)
+        self.feed(m, "tool_batch.effect.terminal",
+                  {"record": {"effect_id": "ghost", "tool_name": "bash",
+                              "outcome": {"kind": "completed"}}})
+        self.assertIn("bash returned (completed)", [t for _, _, t in m.notes])
+        self.assertEqual(m.tally["ran"], 0)
+        self.assertEqual((len(m.active), len(m.pending)), (0, 0))
+
+    def test_waited_counts_at_return_not_at_asking(self):
+        mod = self.load_margin(); m = self.fresh(mod)
+        self.feed(m, "approval_wait.effect.started", {"record": {"tool_name": "bash"}})
+        self.assertEqual(m.tally["waited"], 0)
+        self.feed(m, "approval_wait.effect.terminal",
+                  {"record": {"outcome": {"kind": "approved"}}})
+        self.assertEqual(m.tally["waited"], 1)
+
+    def test_button_hitbox_matches_clipped_drawing(self):
+        mod = self.load_margin(); m = self.fresh(mod)
+        self.feed(m, "runtime.session", {"event": {
+            "kind": "assistant_message_committed", "text": "held"}})
+        mod.render(m, 30, 44)
+        row, col0, col1 = m.button
+        self.assertLessEqual(col1, 30)
+        self.assertFalse(mod.hit_button(m, 35, row + 1))  # past the drawing
+        self.assertTrue(mod.hit_button(m, col0 + 2, row + 1))
+
+    def test_wide_characters_count_two_cells(self):
+        mod = self.load_margin()
+        with tempfile.TemporaryDirectory() as d:
+            kept = os.path.join(d, "kept.txt")
+            with open(kept, "w", encoding="utf-8") as f:
+                f.write("保持冷静并继续前进，保持冷静并继续前进\n")
+            m = mod.Margin(kept_path=kept)
+            for line in plain(mod.render(m, 42, 44)).splitlines():
+                self.assertLessEqual(mod.display_width(line), 42, line)
+
+    def test_adoption_never_steals_a_live_session(self):
+        mod = self.load_margin()
+        self.assertFalse(mod.should_adopt(False, 10, 1))     # both live
+        self.assertTrue(mod.should_adopt(True, 10, 1))       # ours ended
+        self.assertTrue(mod.should_adopt(False, 400, 1))     # ours long quiet
+        self.assertFalse(mod.should_adopt(False, 400, 500))  # other quieter still
+
+    def test_load_tail_returns_consumed_offset(self):
+        mod = self.load_margin(); m = self.fresh(mod)
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "session.jsonl")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(rec("session.started", {"kind": "session_started"}) + "\n")
+            offset = mod.load_tail(m, path)
+            self.assertEqual(offset, os.path.getsize(path))
+            with open(path, "a", encoding="utf-8") as f:
+                f.write("NEWLINE\n")
+            with open(path, encoding="utf-8") as f:
+                f.seek(offset)
+                self.assertEqual(f.read(), "NEWLINE\n")  # nothing skipped
 
 
 if __name__ == "__main__":

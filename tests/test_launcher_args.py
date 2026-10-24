@@ -43,6 +43,15 @@ class LauncherArgsTest(unittest.TestCase):
     def test_plain_args_untouched(self):
         self.assertEqual(self.forward("exec", "side quest"), "exec side quest")
 
+    def test_margin_after_first_real_arg_is_muses(self):
+        # Layout stripping is leading-position only: a `--margin` meant
+        # for Muse itself must reach it byte-for-byte.
+        self.assertEqual(self.forward("exec", "--margin", "side", "hi"),
+                         "exec --margin side hi")
+        self.assertEqual(self.forward("exec", "--margin=side"),
+                         "exec --margin=side")
+        self.assertEqual(self.forward("exec", "top"), "exec top")
+
     def test_help_is_the_launchers(self):
         r = subprocess.run([LAUNCHER, "--help"], capture_output=True,
                            text=True, env=self.env, timeout=20)
@@ -56,6 +65,7 @@ class LauncherArgsTest(unittest.TestCase):
         env = dict(self.env)
         env["PATH"] = self.dir.name + os.pathsep + "/usr/bin" + os.pathsep + "/bin"
         for args, expected in ((["hello", "world"], "hello world"),
+                               (["exec", "--margin", "hi"], "exec --margin hi"),
                                (["--margin", "side", "exec", "hi"], "exec hi")):
             with open(self.log, "w", encoding="utf-8"):
                 pass

@@ -1,5 +1,17 @@
 #!/bin/sh
 # Wonder in the Margin — sidecar pane launcher.
 # Run in a split/second terminal beside `muse`:
+#   margin-pane            (linked onto PATH by install.sh), or
 #   /path/to/wonder-margin/margin-pane
-exec python3 "$(dirname "$0")/sidecar/margin.py" "$@"
+# Symlinks are resolved first, so a PATH link finds the real sidecar.
+SOURCE=$0
+while [ -h "$SOURCE" ]; do
+  DIR=$(cd -P "$(dirname "$SOURCE")" && pwd)
+  SOURCE=$(readlink "$SOURCE")
+  case $SOURCE in
+    /*) ;;
+    *) SOURCE=$DIR/$SOURCE ;;
+  esac
+done
+DIR=$(cd -P "$(dirname "$SOURCE")" && pwd)
+exec python3 "$DIR/sidecar/margin.py" "$@"

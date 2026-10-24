@@ -25,8 +25,17 @@ case "${1:-}" in
     fi
     ;;
   *)
+    # One kept line is one line: flatten any embedded breaks/tabs to
+    # spaces and trim, so what is confirmed is what the pane will show.
+    LINE="$(printf '%s' "$*" | tr '\n\t' '  ')"
+    LINE="${LINE#"${LINE%%[![:space:]]*}"}"
+    LINE="${LINE%"${LINE##*[![:space:]]}"}"
+    if [ -z "$LINE" ]; then
+      printf '│ ! nothing to keep — the line was blank.\n' >&2
+      exit 1
+    fi
     mkdir -p "$(dirname "$KEPT")"
-    printf '%s\n' "$*" > "$KEPT"
-    printf '│ kept · “%s”\n' "$*"
+    printf '%s\n' "$LINE" > "$KEPT"
+    printf '│ kept · “%s”\n' "$LINE"
     ;;
 esac

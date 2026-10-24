@@ -40,53 +40,68 @@ EOF
   exit 0
 fi
 
+# Layout spellings are honoured in leading position only. The moment a
+# real Muse argument appears, everything after it is Muse's — including
+# any `--margin` meant for Muse itself (e.g. `exec --margin side hi`).
 FILTERED_ARGS=()
-FIRST=1
+LEADING=1
 while [ $# -gt 0 ]; do
   arg="$1"
-  case "$arg" in
-    --) FILTERED_ARGS+=("$1"); shift; FILTERED_ARGS+=("$@"); break ;;
-    --margin-side|--side) LAYOUT="side"; shift ;;
-    --margin-top|--top) LAYOUT="top"; shift ;;
-    --margin=side) LAYOUT="side"; shift ;;
-    --margin=top) LAYOUT="top"; shift ;;
-    --margin)
-      if [ $# -ge 2 ] && { [ "$2" = "side" ] || [ "$2" = "top" ]; }; then
-        LAYOUT="$2"; shift 2
-      else
-        LAYOUT="side"; shift
-      fi ;;
-    side|top)
-      if [ "$FIRST" = "1" ]; then LAYOUT="$arg"; shift; else FILTERED_ARGS+=("$arg"); shift; fi ;;
-    *) FILTERED_ARGS+=("$arg"); shift ;;
-  esac
-  FIRST=0
+  if [ "$LEADING" = "1" ]; then
+    case "$arg" in
+      --) FILTERED_ARGS+=("$1"); shift; FILTERED_ARGS+=("$@"); break ;;
+      --margin-side|--side) LAYOUT="side"; shift; continue ;;
+      --margin-top|--top) LAYOUT="top"; shift; continue ;;
+      --margin=side) LAYOUT="side"; shift; continue ;;
+      --margin=top) LAYOUT="top"; shift; continue ;;
+      --margin)
+        if [ $# -ge 2 ] && { [ "$2" = "side" ] || [ "$2" = "top" ]; }; then
+          LAYOUT="$2"; shift 2
+        else
+          LAYOUT="side"; shift
+        fi; continue ;;
+      side|top) LAYOUT="$arg"; shift; continue ;;
+    esac
+  fi
+  LEADING=0
+  FILTERED_ARGS+=("$arg"); shift
 done
 
 MARGIN_CMD="$(printf '%q' "$MARGIN_PANE")"
 
 # Non-interactive (piped, scripts, dumb terminal): pass straight through.
+# (${arr[@]+...} is the bash 3.2-safe empty-array expansion under `set -u`.)
 if [ ! -t 0 ] || [ ! -t 1 ] || [ "${TERM:-}" = "dumb" ]; then
-  exec "$MUSE_BIN" "${FILTERED_ARGS[@]}"
+  exec "$MUSE_BIN" ${FILTERED_ARGS[@]+"${FILTERED_ARGS[@]}"}
 fi
 
 # No tmux: Muse alone, honestly without me beside it.
 if [ -z "$TMUX_BIN" ] || [ ! -x "$TMUX_BIN" ]; then
   echo "│ ? tmux not found — Muse alone; the margin needs tmux for a side pane." >&2
-  exec "$MUSE_BIN" "${FILTERED_ARGS[@]}"
+  exec "$MUSE_BIN" ${FILTERED_ARGS[@]+"${FILTERED_ARGS[@]}"}
 fi
 
 tmux_setup() {
-  "$TMUX_BIN" set -g mouse on 2>/dev/null || true
-  "$TMUX_BIN" set -g history-limit 50000 2>/dev/null || true
-  "$TMUX_BIN" set -s escape-time 0 2>/dev/null || true
-  "$TMUX_BIN" set -s set-clipboard on 2>/dev/null || true
-  "$TMUX_BIN" set -as terminal-features ",*:RGB" 2>/dev/null || true
-  "$TMUX_BIN" set -as terminal-overrides ",*:Tc" 2>/dev/null || true
+  # Session-scoped only, on the session we are joining. Never -g/-s:
+  # the user's server keeps its own settings throughout. The joined
+  # session's own two values are saved by the caller and restored on
+  # exit, so the session is also left exactly as it was found.
+  "$TMUX_BIN" set-option mouse on 2>/dev/null || true
+  "$TMUX_BIN" set-option history-limit 50000 2>/dev/null || true
 }
 
-# Case 1: already inside tmux — split this window, kill only my pane on exit.
+tmux_restore() { # prev_mouse prev_history_limit
+  if [ -n "$1" ]; then "$TMUX_BIN" set-option mouse "$1" 2>/dev/null || true
+  else "$TMUX_BIN" set-option -u mouse 2>/dev/null || true; fi
+  if [ -n "$2" ]; then "$TMUX_BIN" set-option history-limit "$2" 2>/dev/null || true
+  else "$TMUX_BIN" set-option -u history-limit 2>/dev/null || true; fi
+}
+
+# Case 1: already inside tmux — split this window, kill only my pane on
+# exit, and put the joined session's options back as they were found.
 if [ -n "${TMUX:-}" ]; then
+  PREV_MOUSE="$("$TMUX_BIN" show-option -qv mouse 2>/dev/null || true)"
+  PREV_HIST="$("$TMUX_BIN" show-option -qv history-limit 2>/dev/null || true)"
   tmux_setup
   if [ "$LAYOUT" = "top" ]; then
     PANE_ID=$("$TMUX_BIN" split-window -b -v -l "${MARGIN_HEIGHT:-16}" -P -F "#{pane_id}" "$MARGIN_CMD" 2>/dev/null || true)
@@ -96,10 +111,16 @@ if [ -n "${TMUX:-}" ]; then
     [ -n "$PANE_ID" ] && "$TMUX_BIN" select-pane -L 2>/dev/null || true
   fi
   if [ -n "${PANE_ID:-}" ]; then
-    cleanup() { "$TMUX_BIN" kill-pane -t "$PANE_ID" 2>/dev/null || true; }
+    cleanup() {
+      tmux_restore "$PREV_MOUSE" "$PREV_HIST"
+      "$TMUX_BIN" kill-pane -t "$PANE_ID" 2>/dev/null || true
+    }
     trap cleanup EXIT INT TERM
+  else
+    echo "│ ? margin pane could not open (window too small?) — Muse alone; your tmux session was left as found." >&2
+    tmux_restore "$PREV_MOUSE" "$PREV_HIST"
   fi
-  "$MUSE_BIN" "${FILTERED_ARGS[@]}"
+  "$MUSE_BIN" ${FILTERED_ARGS[@]+"${FILTERED_ARGS[@]}"}
   exit $?
 fi
 
@@ -125,14 +146,14 @@ EOF
 STATUS_OPT="off"
 [ "${MARGIN_TMUX_STATUS:-0}" = "1" ] && STATUS_OPT="on"
 RUNNER_CMD="$RUNNER $(printf '%q' "$MUSE_BIN") $(printf '%q' "$SESSION_NAME") $(printf '%q' "$RUNNER")"
-for a in "${FILTERED_ARGS[@]}"; do RUNNER_CMD="$RUNNER_CMD $(printf '%q' "$a")"; done
+for a in ${FILTERED_ARGS[@]+"${FILTERED_ARGS[@]}"}; do RUNNER_CMD="$RUNNER_CMD $(printf '%q' "$a")"; done
 
+# Every option below is scoped to our own session (-t). Server-wide
+# options are never touched, so the user's tmux server is left as found.
 if [ "$LAYOUT" = "top" ]; then
   exec "$TMUX_BIN" new-session -s "$SESSION_NAME" "$RUNNER_CMD" \; \
     set-option -t "$SESSION_NAME" mouse on \; \
     set-option -t "$SESSION_NAME" history-limit 50000 \; \
-    set-option -s escape-time 0 \; \
-    set-option -s set-clipboard on \; \
     set-option -t "$SESSION_NAME" destroy-unattached on \; \
     set-option -t "$SESSION_NAME" status "$STATUS_OPT" \; \
     split-window -b -v -l "${MARGIN_HEIGHT:-16}" "$MARGIN_CMD" \; \
@@ -141,8 +162,6 @@ else
   exec "$TMUX_BIN" new-session -s "$SESSION_NAME" "$RUNNER_CMD" \; \
     set-option -t "$SESSION_NAME" mouse on \; \
     set-option -t "$SESSION_NAME" history-limit 50000 \; \
-    set-option -s escape-time 0 \; \
-    set-option -s set-clipboard on \; \
     set-option -t "$SESSION_NAME" destroy-unattached on \; \
     set-option -t "$SESSION_NAME" status "$STATUS_OPT" \; \
     split-window -h -l "${MARGIN_WIDTH:-42}" "$MARGIN_CMD" \; \

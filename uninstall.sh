@@ -3,15 +3,52 @@
 # plugin record. Your source checkout is left exactly where it is.
 set -uo pipefail
 
+SOURCE="${BASH_SOURCE[0]}"
+while [ -h "$SOURCE" ]; do
+  DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
 BIN_DIR="${XDG_BIN_HOME:-${HOME:-}/.local/bin}"
 say() { printf '│ %s\n' "$*"; }
+usage() {
+  cat <<'EOF'
+│ uninstall.sh — remove Wonder in the Margin's PATH links and plugin
+│
+│   ./uninstall.sh          remove links that point at this checkout,
+│                           plus the installed plugin record
+│   ./uninstall.sh --help   this text (removes nothing)
+│
+│ Receipts of ownership are checked link by link: a same-named file that
+│ is not Wonder's is left exactly where it is. This checkout stays.
+EOF
+}
+for _arg in "$@"; do
+  case "$_arg" in
+    --help|-h) usage; exit 0 ;;
+    *) printf '│ ! unknown argument: %s\n' "$_arg" >&2; usage >&2; exit 2 ;;
+  esac
+done
 
-rm -f "$BIN_DIR/muse-margin" "$BIN_DIR/muse-margintop" "$BIN_DIR/margin-keep"
-say "· removed muse-margin links from $BIN_DIR"
+# Remove only links that point at this checkout. A same-named file that
+# is not Wonder's is the user's, and stays exactly where it is.
+remove_ours() {
+  if [ -L "$1" ] && [ "$(readlink "$1")" = "$2" ]; then
+    rm -f "$1"
+  elif [ -e "$1" ] || [ -L "$1" ]; then
+    say "· kept $1 — it does not point at this plugin"
+  fi
+}
+remove_ours "$BIN_DIR/muse-margin" "$DIR/muse-margin"
+remove_ours "$BIN_DIR/muse-margintop" "$DIR/muse-margin"
+remove_ours "$BIN_DIR/margin-pane" "$DIR/margin-pane"
+remove_ours "$BIN_DIR/margin-keep" "$DIR/margin-keep"
+say "· removed muse-margin links from $BIN_DIR (any that were Wonder's)"
 say "· your kept line, if any, stays at ~/.local/share/wonder-margin/kept.txt — it is yours, not mine to delete"
 
 SHIM_DIR="${HOME:-}/.local/share/wonder-margin/bin"
-if [ -L "$SHIM_DIR/muse" ]; then
+if [ -L "$SHIM_DIR/muse" ] && [ "$(readlink "$SHIM_DIR/muse")" = "$DIR/shim/muse" ]; then
   rm -f "$SHIM_DIR/muse"
   say "· removed muse shim (drop its PATH line from your shell rc if you added one)"
 fi
