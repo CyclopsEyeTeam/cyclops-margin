@@ -19,12 +19,22 @@ done
 SHIM_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
 PLUGIN_DIR="$(cd -P "$SHIM_DIR/.." && pwd)"
 
+canon_dir() { (cd -P -- "$1" 2>/dev/null && pwd) || printf '%s\n' "$1"; }
+
 find_real_muse() {
+  # PATH entries are canonicalised before comparison: a trailing slash,
+  # a `.`, or a symlinked bin dir must not let the shim mistake itself
+  # for the real muse and exec itself forever.
+  local invoked_c shim_c
+  invoked_c="$(canon_dir "$INVOKED_DIR")"
+  shim_c="$(canon_dir "$SHIM_DIR")"
   local IFS=:
-  local d
+  local d c
   for d in $PATH; do
-    [ "$d" = "$INVOKED_DIR" ] && continue
-    [ "$d" = "$SHIM_DIR" ] && continue
+    [ -n "$d" ] || d="."
+    c="$(canon_dir "$d")"
+    [ "$c" = "$invoked_c" ] && continue
+    [ "$c" = "$shim_c" ] && continue
     if [ -x "$d/muse" ]; then
       printf '%s\n' "$d/muse"
       return 0

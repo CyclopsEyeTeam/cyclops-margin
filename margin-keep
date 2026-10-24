@@ -12,30 +12,42 @@ set -uo pipefail
 
 KEPT="${MARGIN_KEPT:-${HOME:-}/.local/share/wonder-margin/kept.txt}"
 
+# Display and storage never carry terminal control: escapes are stripped
+# on the way in, and again on the way out (in case the file was written
+# by something else), so the show-back cannot inject into your terminal.
+strip_controls() { tr -d '\001-\010\013\014\016-\037\177'; }
+
 case "${1:-}" in
   --clear|--forget)
-    rm -f "$KEPT"
+    if ! rm -f "$KEPT" 2>/dev/null; then
+      printf '│ ! could not remove %s — nothing was let go.\n' "$KEPT" >&2
+      exit 1
+    fi
     printf '│ · kept line let go.\n'
     ;;
   "")
     if [ -s "$KEPT" ]; then
-      printf '│ kept · “%s”\n' "$(head -n 1 "$KEPT")"
+      printf '│ kept · “%s”\n' "$(head -n 1 "$KEPT" | strip_controls)"
     else
       printf '│ · nothing kept yet — margin-keep "a line worth keeping"\n'
     fi
     ;;
   *)
     # One kept line is one line: flatten any embedded breaks/tabs to
-    # spaces and trim, so what is confirmed is what the pane will show.
-    LINE="$(printf '%s' "$*" | tr '\n\t' '  ')"
+    # spaces, strip control characters, and trim — so what is confirmed
+    # is exactly what the pane will show.
+    LINE="$(printf '%s' "$*" | tr '\n\t' '  ' | strip_controls)"
     LINE="${LINE#"${LINE%%[![:space:]]*}"}"
     LINE="${LINE%"${LINE##*[![:space:]]}"}"
     if [ -z "$LINE" ]; then
       printf '│ ! nothing to keep — the line was blank.\n' >&2
       exit 1
     fi
-    mkdir -p "$(dirname "$KEPT")"
-    printf '%s\n' "$LINE" > "$KEPT"
+    # The confirmation is earned: it prints only after the write lands.
+    if ! mkdir -p "$(dirname "$KEPT")" 2>/dev/null || ! printf '%s\n' "$LINE" > "$KEPT" 2>/dev/null; then
+      printf '│ ! could not write %s — the line was NOT kept.\n' "$KEPT" >&2
+      exit 1
+    fi
     printf '│ kept · “%s”\n' "$LINE"
     ;;
 esac

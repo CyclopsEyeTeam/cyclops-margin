@@ -2,12 +2,8 @@
   "schemaVersion": 1,
   "name": "wonder-margin",
   "displayName": "Wonder — Muse in the Margin",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Wonder, Muse Code's own terminal presence: a living margin that annotates only what it has observed.",
-  "author": { "name": "Cyclops Eye Team", "url": "https://github.com/CyclopsEyeTeam" },
-  "homepage": "https://github.com/CyclopsEyeTeam/cyclops-margin",
-  "repository": "https://github.com/CyclopsEyeTeam/cyclops-margin",
-  "license": "MIT",
   "compat": {
     "source": "native",
     "manifestDir": ".muse-plugin"

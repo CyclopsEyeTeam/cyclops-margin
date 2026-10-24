@@ -131,7 +131,7 @@ RUNNER="$(mktemp "/tmp/muse-margin-run-XXXXXX.sh")"
 chmod 700 "$RUNNER"
 cat > "$RUNNER" <<'EOF'
 #!/usr/bin/env bash
-MUSE="$1"; SESSION="$2"; RUNNER_FILE="$3"; shift 3
+MUSE="$1"; SESSION="$2"; RUNNER_FILE="$3"; TMUXBIN="$4"; shift 4
 "$MUSE" "$@"
 CODE=$?
 rm -f "$RUNNER_FILE" 2>/dev/null || true
@@ -139,13 +139,16 @@ if [ "$CODE" -ne 0 ] && [ "$CODE" -ne 130 ]; then
   printf '\n│ ! Muse exited with code %s. Press Enter to close (10s)… ' "$CODE" >&2
   read -t 10 -r _ 2>/dev/null || true
 fi
-tmux kill-session -t "$SESSION" 2>/dev/null || true
+"$TMUXBIN" kill-session -t "$SESSION" 2>/dev/null || true
 exit "$CODE"
 EOF
 
 STATUS_OPT="off"
 [ "${MARGIN_TMUX_STATUS:-0}" = "1" ] && STATUS_OPT="on"
-RUNNER_CMD="$RUNNER $(printf '%q' "$MUSE_BIN") $(printf '%q' "$SESSION_NAME") $(printf '%q' "$RUNNER")"
+# tmux runs this string through the user's default shell, so name bash
+# explicitly: the %q quoting below is bash quoting, and dash/fish would
+# mis-parse it. The runner also gets $TMUX_BIN, never a bare `tmux`.
+RUNNER_CMD="bash $(printf '%q' "$RUNNER") $(printf '%q' "$MUSE_BIN") $(printf '%q' "$SESSION_NAME") $(printf '%q' "$RUNNER") $(printf '%q' "$TMUX_BIN")"
 for a in ${FILTERED_ARGS[@]+"${FILTERED_ARGS[@]}"}; do RUNNER_CMD="$RUNNER_CMD $(printf '%q' "$a")"; done
 
 # Every option below is scoped to our own session (-t). Server-wide

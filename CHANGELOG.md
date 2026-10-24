@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.3.2 — 2026-10-24
+
+Second fresh-eyes pass: the contract now holds in the places 0.3.1 missed.
+
+- Shim canonicalises PATH directories; it can no longer exec itself.
+- margin-keep only confirms after the write lands, reports failed
+  writes/removals, and stores no control characters.
+- Sanitisation reaches session-end reason, session id, state text, and
+  invisible bidi/zero-width characters.
+- Tally is an allowlist (`completed` only); unknown outcomes and nested
+  failure/error earn no stroke. The mark leaves a finished deed instead
+  of ticking on it. Orphan approval/workflow endings earn no stroke.
+- Partial log lines are buffered, the tail read is bounded (2 MB), and
+  the model header shows `—` until the host actually configures one.
+- Adoption threshold 30s; dedicated runner honours $TMUX_BIN and runs
+  under bash; install pre-flights all links; uninstall judges links
+  canonically (relative symlinks included).
+
 ## 0.3.1 — 2026-10-24
 
 Fresh-eyes review fixes. The pane's honesty contract is unchanged; what

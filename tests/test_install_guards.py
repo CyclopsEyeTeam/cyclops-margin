@@ -93,6 +93,36 @@ class InstallGuardTest(unittest.TestCase):
         self.assertEqual(os.readlink(os.path.join(self.bin, "margin-pane")),
                          os.path.join(ROOT, "margin-pane"))
 
+    def test_stranger_at_last_link_blocks_whole_install(self):
+        # Pre-flight: a stranger's margin-keep (the LAST link) must stop
+        # the install before ANY link or plugin change happens.
+        victim = os.path.join(self.bin, "margin-keep")
+        with open(victim, "w", encoding="utf-8") as f:
+            f.write("mine\n")
+        r = self.run_script(INSTALL)
+        self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertFalse(os.path.lexists(os.path.join(self.bin, "muse-margin")))
+        self.assertFalse(os.path.lexists(os.path.join(self.bin, "margin-pane")))
+
+    def test_uninstall_removes_relative_links_into_checkout(self):
+        r = self.run_script(INSTALL)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        link = os.path.join(self.bin, "margin-pane")
+        os.unlink(link)
+        os.symlink(os.path.relpath(os.path.join(ROOT, "margin-pane"), self.bin), link)
+        r = self.run_script(UNINSTALL)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertFalse(os.path.lexists(link))
+
+    def test_plugin_manifest_matches_changelog(self):
+        import json, re
+        with open(os.path.join(ROOT, ".muse-plugin", "plugin.json"), encoding="utf-8") as f:
+            manifest = json.load(f)
+        self.assertEqual(manifest["name"], "wonder-margin")
+        with open(os.path.join(ROOT, "CHANGELOG.md"), encoding="utf-8") as f:
+            latest = re.search(r"## (\d+\.\d+\.\d+)", f.read()).group(1)
+        self.assertEqual(manifest["version"], latest)
+
     def test_install_uninstall_round_trip_and_stranger_kept(self):
         r = self.run_script(INSTALL)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)

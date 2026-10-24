@@ -58,6 +58,24 @@ class LauncherArgsTest(unittest.TestCase):
         self.assertIn("muse-margin", r.stdout)
         self.assertEqual(r.returncode, 0)
 
+    def test_shim_never_execs_itself_via_sloppy_path(self):
+        # The shim lives behind a symlink in bindir; a trailing-slash PATH
+        # entry for bindir must still be recognised as the shim's own
+        # directory, or find_real_muse returns the shim and it loops.
+        bindir = os.path.join(self.dir.name, "shimbin")
+        os.makedirs(bindir)
+        os.symlink(SHIM, os.path.join(bindir, "muse"))
+        env = dict(self.env)
+        env["PATH"] = bindir + "/" + os.pathsep + self.dir.name + os.pathsep + "/usr/bin" + os.pathsep + "/bin"
+        with open(self.log, "w", encoding="utf-8"):
+            pass
+        r = subprocess.run([os.path.join(bindir, "muse"), "hello", "world"],
+                           input="x\n", capture_output=True, text=True,
+                           env=env, timeout=10)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        with open(self.log, encoding="utf-8") as f:
+            self.assertEqual(f.read().strip(), "hello world")
+
     def test_shim_forwards_and_intercepts(self):
         # PATH puts the stub `muse` first; the shim must find it as the
         # real binary, forward plain calls unchanged, and intercept

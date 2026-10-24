@@ -521,5 +521,100 @@ class ReviewFixTest(unittest.TestCase):
                 self.assertEqual(f.read(), "NEWLINE\n")  # nothing skipped
 
 
+class SecondReviewTest(unittest.TestCase):
+    """Regressions from the second fresh-eyes review (0.3.2)."""
+
+    def load_margin(self):
+        spec = importlib.util.spec_from_file_location("margin", SCRIPT)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def fresh(self, mod):
+        return mod.Margin(kept_path=os.path.join(tempfile.gettempdir(),
+                                                  "wonder-no-such-kept.txt"))
+
+    def feed(self, m, pt, payload, **kw):
+        m.feed(json.loads(rec(pt, payload, **kw)))
+
+    def cycle(self, m, tool, eid, outcome="completed", nested=None):
+        self.feed(m, "tool_batch.effect.started",
+                  {"record": {"tool_name": tool, "effect_id": eid}})
+        out = {"kind": outcome}
+        if nested:
+            out["task_completion"] = {"terminal": {"kind": nested}}
+        self.feed(m, "tool_batch.effect.terminal",
+                  {"record": {"effect_id": eid, "outcome": out}})
+
+    def test_session_end_reason_is_sanitised(self):
+        mod = self.load_margin(); m = self.fresh(mod)
+        self.feed(m, "session.end", {"record": {"exit_reason": "\x1b[31mEVIL ✓ FAKE"}})
+        frame = mod.render(m, 42, 44)
+        self.assertNotIn("\x1b[31mEVIL", frame)
+        self.assertNotIn("✓", plain(frame))
+        self.assertNotIn("✓", m.state)
+        self.assertEqual(mod.clean("a" + chr(0x202E) + "b" + chr(0x200B) + "c"), "abc")
+
+    def test_model_is_dash_until_configured(self):
+        mod = self.load_margin(); m = self.fresh(mod)
+        self.feed(m, "runtime.user_intent.accepted", {})
+        text = plain(mod.render(m, 42, 44))
+        self.assertNotIn("muse-wonder-full-1.0", text)
+        self.feed(m, "run.model.configured", {"record": {"display_label": "muse-x-9"}})
+        self.assertIn("muse-x-9", plain(mod.render(m, 42, 44)))
+
+    def test_tally_allowlist_and_nested_synonyms(self):
+        mod = self.load_margin()
+        for outcome in ("timeout", "aborted", "denied", "rejected", "something-new"):
+            m = self.fresh(mod)
+            self.cycle(m, "bash", "e1", outcome=outcome)
+            self.assertEqual(m.tally["ran"], 0, outcome)
+            self.assertIn(f"bash returned ({outcome})", [t for _, _, t in m.notes])
+        for nested in ("failure", "error"):
+            m = self.fresh(mod)
+            self.cycle(m, "bash", "e1", nested=nested)
+            self.assertEqual(m.sigil, "!", nested)
+            self.assertEqual(m.tally["ran"], 0, nested)
+        m = self.fresh(mod)
+        self.cycle(m, "bash", "e1")
+        self.assertEqual(m.tally["ran"], 1)  # completed still earns its stroke
+
+    def test_return_moves_the_mark_off_the_deed(self):
+        mod = self.load_margin(); m = self.fresh(mod)
+        self.cycle(m, "read_file", "r1")
+        self.assertEqual(m.state, "attending")
+        self.assertNotIn("Wonder · reading", plain(mod.render(m, 42, 44)))
+
+    def test_orphan_endings_earn_no_stroke(self):
+        mod = self.load_margin(); m = self.fresh(mod)
+        self.feed(m, "approval_wait.effect.terminal",
+                  {"record": {"outcome": {"kind": "approved"}}})
+        self.assertEqual(m.tally["waited"], 0)
+        self.feed(m, "runtime.session", {"event": {
+            "kind": "workflow_child_lifecycle", "status": "completed",
+            "label": "ghost"}})
+        self.assertEqual(m.tally["branched"], 0)
+        self.feed(m, "subagent.control.result_ready", {"record": {}})
+        self.assertEqual(m.tally["branched"], 0)
+
+    def test_partial_lines_are_buffered_not_dropped(self):
+        mod = self.load_margin(); m = self.fresh(mod)
+        line = rec("tool_batch.effect.started",
+                   {"record": {"tool_name": "read_file", "effect_id": "p1"}})
+        carry = mod.feed_buffer(m, line[:20])
+        self.assertEqual(carry, line[:20])
+        self.assertEqual(m.marks, 0)
+        carry = mod.feed_buffer(m, line[20:] + "\n", carry)
+        self.assertEqual(carry, "")
+        self.assertIn("reading — read_file", [t for _, _, t in m.notes])
+
+    def test_emoji_family_and_combining_widths(self):
+        mod = self.load_margin()
+        fam = "\U0001F468" + chr(0x200D) + "\U0001F469" + chr(0x200D) + "\U0001F467"
+        self.assertEqual(mod.display_width(fam), 2)
+        self.assertEqual(mod.display_width("e" + chr(0x301)), 1)  # combining acute
+        self.assertLessEqual(mod.display_width(mod.clip(fam * 30, 42)), 42)
+
+
 if __name__ == "__main__":
     unittest.main()

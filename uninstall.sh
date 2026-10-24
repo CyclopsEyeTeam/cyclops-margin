@@ -31,12 +31,30 @@ for _arg in "$@"; do
   esac
 done
 
-# Remove only links that point at this checkout. A same-named file that
-# is not Wonder's is the user's, and stays exactly where it is.
+# Remove only links that point at this checkout, judged canonically —
+# a relative symlink into the checkout is ours just as an absolute one
+# is (install.sh accepts both). A same-named file that is not Wonder's
+# is the user's, and stays exactly where it is.
+canon() {
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$1"
+  else
+    printf '%s\n' "$1"
+  fi
+}
 remove_ours() {
-  if [ -L "$1" ] && [ "$(readlink "$1")" = "$2" ]; then
-    rm -f "$1"
-  elif [ -e "$1" ] || [ -L "$1" ]; then
+  if [ -L "$1" ]; then
+    _raw="$(readlink "$1")"
+    case "$_raw" in
+      /*) _abs="$_raw" ;;
+      *) _abs="$(dirname "$1")/$_raw" ;;
+    esac
+    if [ "$(canon "$_abs")" = "$(canon "$2")" ]; then
+      rm -f "$1"
+      return 0
+    fi
+  fi
+  if [ -e "$1" ] || [ -L "$1" ]; then
     say "· kept $1 — it does not point at this plugin"
   fi
 }
@@ -48,9 +66,9 @@ say "· removed muse-margin links from $BIN_DIR (any that were Wonder's)"
 say "· your kept line, if any, stays at ~/.local/share/wonder-margin/kept.txt — it is yours, not mine to delete"
 
 SHIM_DIR="${HOME:-}/.local/share/wonder-margin/bin"
-if [ -L "$SHIM_DIR/muse" ] && [ "$(readlink "$SHIM_DIR/muse")" = "$DIR/shim/muse" ]; then
-  rm -f "$SHIM_DIR/muse"
-  say "· removed muse shim (drop its PATH line from your shell rc if you added one)"
+if [ -L "$SHIM_DIR/muse" ]; then
+  remove_ours "$SHIM_DIR/muse" "$DIR/shim/muse"
+  [ -L "$SHIM_DIR/muse" ] || say "· removed muse shim (drop its PATH line from your shell rc if you added one)"
 fi
 
 if command -v muse >/dev/null 2>&1 && muse plugins list --json 2>/dev/null | grep -q '"wonder-margin"'; then

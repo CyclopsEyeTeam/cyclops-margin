@@ -36,32 +36,48 @@ CSI_RE = re.compile(r"\033\[[0-9;?]*[A-Za-z~]")
 ESC_RE = re.compile(r"\033.")
 PASTE_RE = re.compile(r"\033\[200~[\s\S]*?(?:\033\[201~|$)")
 CTRL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+INVIS_RE = re.compile("[" + "".join(chr(c) for c in (0x200B, 0x200C, 0x200D, 0x200E, 0x200F, 0x202A, 0x202B, 0x202C, 0x202D, 0x202E, 0x2060, 0x2061, 0x2062, 0x2063, 0x2064, 0x00AD, 0xFEFF)) + "]")
+ZWJ = chr(0x200D); VS16 = chr(0xFE0F)
 
 def clean(text):
     """Strip control characters from host-supplied text before rendering.
 
     A kept line or a logged subject is data, never terminal control: an
     escape in it would let the log draw marks the pane has no right to
-    draw. The `✓` glyph is also removed — it is Wonder's earned mark,
-    earned only in voice, and untrusted text may not borrow it.
+    draw. Invisible format characters (bidi overrides, zero-width marks)
+    go too: text may not silently reorder the pane. The `✓` glyph is
+    also removed — it is Wonder's earned mark, earned only in voice,
+    and untrusted text may not borrow it.
     """
-    return CTRL_RE.sub("", str(text)).replace("✓", "")
+    return INVIS_RE.sub("", CTRL_RE.sub("", str(text))).replace("✓", "")
 
-def cell_width(ch):
-    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+def char_widths(s):
+    """Per-character cell widths: wide = 2, combining/ZWJ/VS = 0, and a
+    character joined by a ZWJ adds nothing (an emoji family is one glyph)."""
+    widths = []
+    for i, ch in enumerate(s):
+        if unicodedata.combining(ch) or ch in (ZWJ, VS16) or (i and s[i - 1] == ZWJ):
+            widths.append(0)
+        elif unicodedata.east_asian_width(ch) in ("W", "F"):
+            widths.append(2)
+        else:
+            widths.append(1)
+    return widths
 
 def display_width(text):
-    """Visible cells of a string, ignoring ANSI escapes, wide chars = 2."""
-    return sum(cell_width(ch) for ch in ANSI_RE.sub("", text))
+    """Visible cells of a string, ignoring ANSI escapes."""
+    return sum(char_widths(ANSI_RE.sub("", text)))
 
 def clip(text, width):
     """Truncate by visible cells, keeping ANSI escapes intact."""
     out, visible, i = [], 0, 0
+    wlist = char_widths(ANSI_RE.sub("", text))
+    ci = 0
     while i < len(text) and visible < width:
         m = ANSI_RE.match(text, i)
         if m:
             out.append(m.group(0)); i = m.end(); continue
-        w = cell_width(text[i])
+        w = wlist[ci]; ci += 1
         if visible + w > width:
             break
         out.append(text[i]); visible += w; i += 1
@@ -134,8 +150,11 @@ class Margin:
         self.page_pos = 0        # where my mark sits on the page
         self.last_signal = time.time()
         self.session = "—"
-        self.model = "muse-wonder-full-1.0"
+        self.model = "—"         # unobserved until run.model.configured says so
         self.ended = False       # this session's end was observed (adoption gate)
+        self._approval_open = False  # an approval ask was seen, not yet settled
+        self._branches_open = 0      # subagent spawns seen, not yet back
+        self._branch_labels = set()  # workflow children seen started
         self.active = {}         # effect/call id -> tool name, for honest returns
         self.pending = {}        # effect/call id -> start-note text, collapsed on return
         self.stamps = []         # mark times, newest last, for the rhythm row
@@ -192,7 +211,10 @@ class Margin:
         self.trail = self.trail[-24:]
 
     def set(self, sigil, state, colour, detail=""):
-        self.sigil, self.state, self.colour = sigil, state, colour
+        self.sigil, self.colour = sigil, colour
+        # State text can carry host fields (e.g. the session-end reason):
+        # it is rendered, so it is cleaned like every other host string.
+        self.state = clean(state)
         self.detail = clean(detail)
         self.state_since = self._now()
 
@@ -204,7 +226,7 @@ class Margin:
         kind = ev.get("kind") or pl.get("kind") or ""
         if pt == "session.started":
             sid = (rec.get("stream") or {}).get("id", "")
-            self.session = sid[:8] if sid else self.session
+            self.session = clean(sid[:8]) if sid else self.session
             self.set("·", "resting", GREY); self.note("·", GREY, "session opened — present, nothing claimed")
         elif pt == "session.end":
             reason = (pl.get("record") or {}).get("exit_reason") or "ended"
@@ -218,26 +240,36 @@ class Margin:
             self.set("›", "attending", INK); self.note("›", INK, "prompt received (text never shown here)")
         elif pt == "approval_wait.effect.started":
             tool = (pl.get("record") or {}).get("tool_name", "a tool")
+            self._approval_open = True
             self.set("?", "waiting for approval", AMBER); self.note("?", AMBER, f"approval asked — {tool} held")
         elif pt == "approval_wait.effect.terminal":
             # The tally counts deeds that returned; the wait returns here,
-            # not when it was asked.
-            self.tally["waited"] += 1
+            # not when it was asked — and only a wait actually seen asked
+            # earns the stroke (a pane opened mid-approval saw no wait).
+            if self._approval_open:
+                self.tally["waited"] += 1
+                self._approval_open = False
             outcome = ((pl.get("record") or {}).get("outcome") or {}).get("kind", "settled")
             self.set("›", "attending", INK); self.note("›", INK, f"approval {outcome}")
         elif pt == "subagent.control.spawn_accepted":
+            self._branches_open += 1
             self.set("⌥", "branching", INK); self.note("⌥", INK, "branch opened — a subagent steps out")
         elif pt == "subagent.control.result_ready":
-            self.tally["branched"] += 1
+            if self._branches_open:
+                self.tally["branched"] += 1
+                self._branches_open -= 1
             self.note("⌥", GREY, "branch back — subagent result ready")
         elif kind == "workflow_child_lifecycle":
             # Only the edges are marks; usage/terminal bookkeeping is not.
             label = ev.get("label") or "workflow child"
             if ev.get("status") == "started":
+                self._branch_labels.add(label)
                 self.set("⌥", "branching", INK, detail=label)
                 self.note("⌥", INK, f"branch — {label}")
             elif ev.get("status") == "completed":
-                self.tally["branched"] += 1
+                if label in self._branch_labels:
+                    self.tally["branched"] += 1
+                    self._branch_labels.discard(label)
                 self.note("⌥", GREY, f"branch back — {label}")
         elif kind == "context_compaction_installed":
             # A candidate is not a fold. Only the installed fold is claimed,
@@ -294,22 +326,37 @@ class Margin:
             if started and not any(v[0] == started for v in self.pending.values()):
                 self.notes = [n for n in self.notes if n[2] != started]
             disp = tool.rsplit("__", 1)[-1] if tool.startswith("mcp__") else tool
-            if "fail" in outcome or "error" in outcome or nested == "failed":
+            failed = ("fail" in outcome or "error" in outcome
+                      or nested in ("failed", "failure", "error"))
+            stopped = (outcome in ("cancelled", "interrupted")
+                       or nested in ("cancelled", "interrupted"))
+            if failed:
                 shown = nested if outcome == "completed" and nested else outcome
                 self.set("!", "a tool reported a problem", RED); self.note("!", RED, f"{disp} came back wrong: {shown}")
-            elif outcome == "cancelled" or nested == "cancelled":
-                self.set("—", "interrupted", AMBER); self.note("—", AMBER, f"{disp} interrupted (cancelled)")
+            elif stopped:
+                shown = nested if outcome == "completed" and nested else outcome
+                self.set("—", "interrupted", AMBER); self.note("—", AMBER, f"{disp} interrupted ({shown})")
             elif not observed:
                 # A terminal whose start was never seen (the tail window cut
                 # between them) proves a return, not a deed: no tally stroke
                 # is invented for work the pane did not watch begin.
                 self.note("~", GREY, f"{disp} returned ({outcome})")
+            elif outcome != "completed":
+                # An allowlist, not a denylist: only `completed` is a clean
+                # return. Anything else (timeout, aborted, denied, …) is
+                # noted literally and earns no stroke — an unknown outcome
+                # must never be laundered into a deed by not matching a
+                # failure list.
+                self.note("~", GREY, f"{disp} returned ({outcome})")
+                if not self.pending:
+                    self.set("›", "attending", INK)
             else:
                 # A return is a return — never a success verdict. It replaces
                 # its start note, so one tool leaves one line, not two. Each
                 # kind of work gets its own closing voice; the outcome in
                 # brackets stays literal, never dressed up. Only a clean
-                # return of an observed start earns a tally stroke.
+                # return of an observed start earns a tally stroke — and the
+                # mark moves off the finished deed instead of ticking on it.
                 if verb == "reading":
                     self.tally["read"] += 1
                     self.note("§", GREY, f"{short or tool} closed ({outcome})")
@@ -326,6 +373,8 @@ class Margin:
                 else:
                     self.tally["ran"] += 1
                     self.note("~", GREY, f"{disp} back ({outcome})")
+                if not self.pending:
+                    self.set("›", "attending", INK)
         elif pt == "runtime.session" and ev.get("operation") == "model.meta.response" and kind in ("scheduled", "started"):
             self.set("›", "responding", INK)
         elif kind == "assistant_message_committed":
@@ -540,10 +589,18 @@ def load_tail(m, path):
     """
     m.session = clean(os.path.basename(os.path.dirname(path))[:8]) or m.session
     try:
+        # Bounded tail: read at most the last 2 MB, never the whole log —
+        # a multi-hundred-MB session must not spike the pane's memory.
         with open(path, encoding="utf-8", errors="ignore") as f:
-            tail = f.readlines()[-3000:]
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - 2_000_000))
+            data = f.read()
             offset = f.tell()
-        for line in tail:
+        lines = data.splitlines()
+        if size > 2_000_000 and lines:
+            lines = lines[1:]  # the first line may be cut mid-record
+        for line in lines[-3000:]:
             try: m.feed(json.loads(line))
             except Exception: pass
         m.page_pos = max(0, m.marks - 1)
@@ -552,17 +609,34 @@ def load_tail(m, path):
         return 0
 
 
+def feed_buffer(m, chunk, carry=""):
+    """Feed complete log lines from `chunk`; return the unterminated rest.
+
+    A line caught mid-write is held in the carry, never parsed half and
+    dropped: its event still arrives when the write completes.
+    """
+    data = carry + chunk
+    lines = data.split("\n")
+    for line in lines[:-1]:
+        if line.strip():
+            try: m.feed(json.loads(line))
+            except Exception: pass
+    return "" if data.endswith("\n") else lines[-1]
+
+
 def should_adopt(current_ended, current_age_s, newer_age_s):
     """Whether the pane may leave its session for a newer one.
 
     A live session is never stolen: two concurrent `muse` sessions would
     otherwise flip the pane between them, discarding its tally and held
     answer on every switch. Adoption needs the current session ended, or
-    quiet for five minutes while the other is active.
+    quiet for 30s while the other is active — long enough that two live
+    sessions never trade places, short enough that a fresh launch does
+    not sit with the previous session's corpse for five minutes.
     """
     if current_ended:
         return True
-    return current_age_s > 300 and newer_age_s < current_age_s
+    return current_age_s > 30 and newer_age_s < current_age_s
 
 def follow(path, once=False, pinned=False):
     m = Margin()
@@ -576,6 +650,7 @@ def follow(path, once=False, pinned=False):
         return
     sys.stdout.write("\033[?25l\033[2J")
     last_draw = ""
+    carry = ""  # trailing partial log line, held until its write completes
     last_check = 0.0
     last_breathe = 0.0
     # A real terminal gets a clickable button (SGR mouse) and keys; a pipe
@@ -611,15 +686,14 @@ def follow(path, once=False, pinned=False):
                         path = newer
                         m = Margin()
                         offset = load_tail(m, path)
+                        carry = ""
             try:
                 cols, rows = term_size()
                 with open(path, encoding="utf-8", errors="ignore") as f:
                     f.seek(offset)
                     chunk = f.read()
                     offset = f.tell()
-                for line in chunk.splitlines():
-                    try: m.feed(json.loads(line))
-                    except Exception: pass
+                carry = feed_buffer(m, chunk, carry)
             except OSError:
                 chunk = ""
             now = time.time()

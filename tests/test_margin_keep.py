@@ -50,6 +50,29 @@ class MarginKeepTest(unittest.TestCase):
         with open(self.path, encoding="utf-8") as f:
             self.assertEqual(f.read(), "line1 line2\n")  # refusal kept the old line
 
+    def raw(self, *args, path=None):
+        env = dict(self.env, MARGIN_KEPT=path or self.path)
+        return subprocess.run([KEEP, *args], capture_output=True, text=True,
+                              env=env, timeout=20)
+
+    def test_failed_write_never_claims_kept(self):
+        # A directory where the file belongs: the write cannot land.
+        r = self.raw("a line", path=self.dir.name)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertNotIn("kept ·", r.stdout)
+        r = self.raw("--clear", path=self.dir.name)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertNotIn("let go", r.stdout)
+
+    def test_escapes_are_not_stored_or_shown(self):
+        r = self.raw("red \x1b[31m alert")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("\x1b", r.stdout)
+        with open(self.path, "rb") as f:
+            self.assertNotIn(b"\x1b", f.read())
+        r = self.raw()
+        self.assertNotIn("\x1b", r.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()
