@@ -21,13 +21,34 @@ PLUGIN_DIR="$(cd -P "$SHIM_DIR/.." && pwd)"
 
 canon_dir() { (cd -P -- "$1" 2>/dev/null && pwd) || printf '%s\n' "$1"; }
 
+resolve_file() { # path -> canonical path after following every symlink
+  local src="$1" dir
+  case "$src" in
+    /*) ;;
+    *) src="$(canon_dir "$(dirname "$src")")/$(basename "$src")" ;;
+  esac
+  while [ -h "$src" ]; do
+    dir="$(cd -P "$(dirname "$src")" && pwd)"
+    src="$(readlink "$src")"
+    case "$src" in
+      /*) ;;
+      *) src="$dir/$src" ;;
+    esac
+  done
+  printf '%s\n' "$src"
+}
+
 find_real_muse() {
   # PATH entries are canonicalised before comparison: a trailing slash,
   # a `.`, or a symlinked bin dir must not let the shim mistake itself
-  # for the real muse and exec itself forever.
-  local invoked_c shim_c
+  # for the real muse and exec itself forever. Candidates are judged by
+  # the file they resolve to, not just their directory: a `muse` in
+  # another directory that is a symlink back to this shim is still the
+  # shim, however many alias directories point at it.
+  local invoked_c shim_c shim_file
   invoked_c="$(canon_dir "$INVOKED_DIR")"
   shim_c="$(canon_dir "$SHIM_DIR")"
+  shim_file="$(resolve_file "$SOURCE")"
   local IFS=:
   local d c
   for d in $PATH; do
@@ -35,7 +56,8 @@ find_real_muse() {
     c="$(canon_dir "$d")"
     [ "$c" = "$invoked_c" ] && continue
     [ "$c" = "$shim_c" ] && continue
-    if [ -x "$d/muse" ]; then
+    if [ -f "$d/muse" ] && [ -x "$d/muse" ]; then
+      [ "$(resolve_file "$d/muse")" = "$shim_file" ] && continue
       printf '%s\n' "$d/muse"
       return 0
     fi

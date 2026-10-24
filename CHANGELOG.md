@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.3.3 — 2026-10-25
+
+Third fresh-eyes pass: two dead-or-dying paths found against the real
+host, and the shells hardened where the second pass stopped early.
+
+- The `responding` state could never fire: it waited for
+  `scheduled`/`started` events carrying `model.meta.response`, a shape
+  that occurs zero times in real session logs. The host declares a
+  model call as `side_effect_intent` with that operation; the pane
+  listens for that now.
+- A pane launched beside a just-starting `muse` (the normal
+  `muse-margin` launch on a fresh install) exited instantly when no
+  session log existed yet. The live pane waits for the first log;
+  `--once` still reports and exits. A truncated log no longer strands
+  the follow offset past EOF, and `newest_session` survives a log
+  vanishing between glob and stat.
+- Parallel workflow children sharing one label were counted once;
+  labels are counted now, so each branch back earns its stroke.
+  US-spelled `canceled` is an interrupt, a future `recorded_at` is
+  distrusted instead of showing a negative clock, malformed log
+  records are inert instead of raising, and a pane narrower than
+  30 cells no longer wraps (the render floor is 10, clipped).
+- margin-keep strips carriage returns, bidi/zero-width characters
+  and the earned tick on store and show, and writes by temp file +
+  rename: a symlink at the kept path is replaced, never followed
+  into truncating its target.
+- `muse-margin` validates `MARGIN_WIDTH`/`MARGIN_HEIGHT` and checks
+  both binaries are executable before any tmux work. The `muse`
+  shim judges PATH candidates by resolved file, so alias directories
+  symlinking back to the shim cannot make it bounce between them.
+  The installer judges another checkout by a manifest that actually
+  names the plugin, not by a passing mention of the string.
+
 ## 0.3.2 — 2026-10-24
 
 Second fresh-eyes pass: the contract now holds in the places 0.3.1 missed.

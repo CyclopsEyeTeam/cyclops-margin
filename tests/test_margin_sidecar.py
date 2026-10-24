@@ -616,5 +616,100 @@ class SecondReviewTest(unittest.TestCase):
         self.assertLessEqual(mod.display_width(mod.clip(fam * 30, 42)), 42)
 
 
+class ThirdReviewTest(unittest.TestCase):
+    """Regressions from the third fresh-eyes review (0.3.3)."""
+
+    def load_margin(self):
+        spec = importlib.util.spec_from_file_location("margin", SCRIPT)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def fresh(self, mod):
+        return mod.Margin(kept_path=os.path.join(tempfile.gettempdir(),
+                                                  "wonder-no-such-kept.txt"))
+
+    def feed(self, m, pt, payload, **kw):
+        m.feed(json.loads(rec(pt, payload, **kw)))
+
+    def test_responding_matches_real_host_shape(self):
+        # Real logs declare a model call as side_effect_intent with
+        # operation=model.meta.response — never as scheduled/started
+        # with that operation (0 matches across local session logs).
+        mod = self.load_margin(); m = self.fresh(mod)
+        self.feed(m, "runtime.session", {"event": {
+            "kind": "side_effect_intent", "operation": "model.meta.response"}})
+        self.assertEqual(m.state, "responding")
+
+    def test_parallel_same_label_workflow_children_each_count(self):
+        mod = self.load_margin(); m = self.fresh(mod)
+        ev = lambda status: {"event": {"kind": "workflow_child_lifecycle",
+                                       "status": status, "label": "reviewer"}}
+        for _ in range(3):
+            self.feed(m, "runtime.session", ev("started"))
+        for _ in range(3):
+            self.feed(m, "runtime.session", ev("completed"))
+        self.assertEqual(m.tally["branched"], 3)
+
+    def test_us_spelling_canceled_is_an_interrupt(self):
+        mod = self.load_margin(); m = self.fresh(mod)
+        self.feed(m, "tool_batch.effect.started",
+                  {"record": {"tool_name": "bash", "effect_id": "e1"}})
+        self.feed(m, "tool_batch.effect.terminal",
+                  {"record": {"effect_id": "e1", "outcome": {"kind": "canceled"}}})
+        self.assertEqual((m.sigil, m.state), ("—", "interrupted"))
+        self.assertEqual(m.tally["ran"], 0)
+
+    def test_future_timestamp_never_shows_a_negative_clock(self):
+        mod = self.load_margin(); m = self.fresh(mod)
+        future = int((time.time() + 3600) * 1_000_000)
+        self.feed(m, "tool_batch.effect.started",
+                  {"record": {"tool_name": "bash", "effect_id": "e1"}},
+                  recorded_at=future)
+        self.assertNotIn("· -", plain(mod.render(m, 42, 44)))
+
+    def test_render_never_exceeds_a_narrow_pane(self):
+        mod = self.load_margin(); m = self.fresh(mod)
+        self.feed(m, "tool_batch.effect.started",
+                  {"record": {"tool_name": "read_file", "effect_id": "e1"}})
+        for line in plain(mod.render(m, 20, 44)).splitlines():
+            self.assertLessEqual(mod.display_width(line), 20, line)
+
+    def test_malformed_records_do_not_raise(self):
+        mod = self.load_margin(); m = self.fresh(mod)
+        for bad in (
+            {"payload_type": "session.started", "stream": {"id": 12345}, "payload": {}},
+            {"payload_type": "approval_wait.effect.terminal",
+             "payload": {"record": {"outcome": "approved"}}},
+            {"payload_type": "runtime.session", "payload": {"event": {
+                "kind": "workflow_child_lifecycle", "status": "started", "label": ["x"]}}},
+            {"payload_type": "tool_batch.effect.started",
+             "payload": {"record": {"tool_name": "bash", "effect_id": ["x"]}}},
+            {"payload_type": "tool_batch.effect.terminal",
+             "payload": {"record": {"effect_id": "e1", "outcome": "completed"}}},
+        ):
+            m.feed(bad)  # must not raise; the line is simply not evidence
+
+    def test_live_pane_waits_for_the_first_log(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = os.path.join(d, "home"); os.makedirs(home)
+            env = dict(os.environ, HOME=home)
+            proc = subprocess.Popen([sys.executable, SCRIPT],
+                                    stdout=subprocess.PIPE, text=True, env=env)
+            try:
+                time.sleep(0.8)
+                self.assertIsNone(proc.poll())  # waiting, not dead
+                log_dir = os.path.join(home, ".local", "share", "muse",
+                                       "sessions", "2026", "01", "01", "deadbeef-1")
+                os.makedirs(log_dir)
+                with open(os.path.join(log_dir, "session.jsonl"), "w", encoding="utf-8") as f:
+                    f.write(rec("session.started", {"kind": "session_started"}) + "\n")
+                time.sleep(1.5)
+            finally:
+                proc.terminate()
+                out = proc.communicate(timeout=10)[0]
+            self.assertIn("WONDER", plain(out))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -39,6 +39,10 @@ CTRL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 INVIS_RE = re.compile("[" + "".join(chr(c) for c in (0x200B, 0x200C, 0x200D, 0x200E, 0x200F, 0x202A, 0x202B, 0x202C, 0x202D, 0x202E, 0x2060, 0x2061, 0x2062, 0x2063, 0x2064, 0x00AD, 0xFEFF)) + "]")
 ZWJ = chr(0x200D); VS16 = chr(0xFE0F)
 
+def _as_dict(value):
+    return value if isinstance(value, dict) else {}
+
+
 def clean(text):
     """Strip control characters from host-supplied text before rendering.
 
@@ -106,7 +110,9 @@ def subject_short(record, tool):
     The log carries the file but never the line, so this is a file
     address, never a file:line. No line is invented.
     """
-    subj = (record.get("parallel_profile") or {}).get("subject") or ""
+    subj = _as_dict(record.get("parallel_profile")).get("subject") or ""
+    if not isinstance(subj, str):
+        subj = str(subj)
     name = subj.split(":", 1)[-1].rsplit("/", 1)[-1] if subj else ""
     if not name and tool.startswith("mcp__"):
         name = tool.rsplit("__", 1)[-1]  # mcp__server__room_read -> room_read
@@ -124,7 +130,11 @@ def event_time(record):
         at = float(raw) / 1_000_000.0
     except (TypeError, ValueError):
         return None
-    return at if at > 1_000_000_000 else None
+    # A stamp far in the future is a corrupt/skewed clock, not evidence:
+    # trusting it would show negative ages and freeze the stale check.
+    if at <= 1_000_000_000 or at > time.time() + 300:
+        return None
+    return at
 
 def sparkline(stamps, n, now=None):
     """One honest history row: marks per minute, newest last."""
@@ -140,7 +150,15 @@ def sparkline(stamps, n, now=None):
 def newest_session():
     base = os.path.expanduser("~/.local/share/muse/sessions")
     files = glob.glob(os.path.join(base, "*", "*", "*", "*", "session.jsonl"))
-    return max(files, key=os.path.getmtime) if files else None
+    newest, newest_mtime = None, None
+    for path in files:
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            continue  # vanished between glob and stat; not the newest
+        if newest_mtime is None or mtime > newest_mtime:
+            newest, newest_mtime = path, mtime
+    return newest
 
 class Margin:
     def __init__(self, kept_path=None):
@@ -154,7 +172,7 @@ class Margin:
         self.ended = False       # this session's end was observed (adoption gate)
         self._approval_open = False  # an approval ask was seen, not yet settled
         self._branches_open = 0      # subagent spawns seen, not yet back
-        self._branch_labels = set()  # workflow children seen started
+        self._branch_labels = {}   # workflow child label -> starts not yet back (labels may repeat in parallel)
         self.active = {}         # effect/call id -> tool name, for honest returns
         self.pending = {}        # effect/call id -> start-note text, collapsed on return
         self.stamps = []         # mark times, newest last, for the rhythm row
@@ -219,27 +237,31 @@ class Margin:
         self.state_since = self._now()
 
     def feed(self, rec):
+        if not isinstance(rec, dict):
+            return
         self._at = event_time(rec)
         pt = rec.get("payload_type") or ""
-        pl = rec.get("payload") or {}
-        ev = pl.get("event") or {}
+        pl = _as_dict(rec.get("payload"))
+        ev = _as_dict(pl.get("event"))
         kind = ev.get("kind") or pl.get("kind") or ""
+        if not isinstance(kind, str):
+            kind = str(kind)
         if pt == "session.started":
-            sid = (rec.get("stream") or {}).get("id", "")
-            self.session = clean(sid[:8]) if sid else self.session
+            sid = _as_dict(rec.get("stream")).get("id", "")
+            self.session = clean(str(sid)[:8]) if sid else self.session
             self.set("·", "resting", GREY); self.note("·", GREY, "session opened — present, nothing claimed")
         elif pt == "session.end":
-            reason = (pl.get("record") or {}).get("exit_reason") or "ended"
+            reason = _as_dict(pl.get("record")).get("exit_reason") or "ended"
             self.ended = True
             self.set("·", f"ended ({reason})", GREY)
             self.note("·", GREY, f"session ended ({reason}) — marks left as they stand")
         elif pt == "run.model.configured":
-            label = (pl.get("record") or {}).get("display_label")
+            label = _as_dict(pl.get("record")).get("display_label")
             if label: self.model = clean(label)
         elif pt == "runtime.user_intent.accepted":
             self.set("›", "attending", INK); self.note("›", INK, "prompt received (text never shown here)")
         elif pt == "approval_wait.effect.started":
-            tool = (pl.get("record") or {}).get("tool_name", "a tool")
+            tool = _as_dict(pl.get("record")).get("tool_name", "a tool")
             self._approval_open = True
             self.set("?", "waiting for approval", AMBER); self.note("?", AMBER, f"approval asked — {tool} held")
         elif pt == "approval_wait.effect.terminal":
@@ -249,7 +271,7 @@ class Margin:
             if self._approval_open:
                 self.tally["waited"] += 1
                 self._approval_open = False
-            outcome = ((pl.get("record") or {}).get("outcome") or {}).get("kind", "settled")
+            outcome = _as_dict(_as_dict(pl.get("record")).get("outcome")).get("kind", "settled")
             self.set("›", "attending", INK); self.note("›", INK, f"approval {outcome}")
         elif pt == "subagent.control.spawn_accepted":
             self._branches_open += 1
@@ -261,15 +283,19 @@ class Margin:
             self.note("⌥", GREY, "branch back — subagent result ready")
         elif kind == "workflow_child_lifecycle":
             # Only the edges are marks; usage/terminal bookkeeping is not.
-            label = ev.get("label") or "workflow child"
+            # Labels are counted, not just seen: parallel children may
+            # share one label, and each return is a branch back.
+            label = clean(ev.get("label") or "workflow child")
             if ev.get("status") == "started":
-                self._branch_labels.add(label)
+                self._branch_labels[label] = self._branch_labels.get(label, 0) + 1
                 self.set("⌥", "branching", INK, detail=label)
                 self.note("⌥", INK, f"branch — {label}")
             elif ev.get("status") == "completed":
-                if label in self._branch_labels:
+                if self._branch_labels.get(label):
                     self.tally["branched"] += 1
-                    self._branch_labels.discard(label)
+                    self._branch_labels[label] -= 1
+                    if not self._branch_labels[label]:
+                        del self._branch_labels[label]
                 self.note("⌥", GREY, f"branch back — {label}")
         elif kind == "context_compaction_installed":
             # A candidate is not a fold. Only the installed fold is claimed,
@@ -277,8 +303,10 @@ class Margin:
             self.set("¦", "folded — context compacted", GREY)
             self.note("¦", GREY, "fold — context compacted; contents not claimed")
         elif pt == "tool_batch.effect.started":
-            r0 = pl.get("record") or {}
+            r0 = _as_dict(pl.get("record"))
             tool = r0.get("tool_name", "tool")
+            if not isinstance(tool, str):
+                tool = str(tool)
             if tool in READ_TOOLS:
                 verb, sigil = "reading", "§"
             elif tool in EDIT_TOOLS:
@@ -294,19 +322,19 @@ class Margin:
             short = subject_short(r0, tool)
             text = f"{verb} — {short}"
             for key in (r0.get("effect_id"), r0.get("call_id")):
-                if key:
+                if key and isinstance(key, (str, int)):
                     self.active[key] = tool
                     self.pending[key] = (text, verb, short)
             self.set(sigil, verb, INK, detail=short); self.note(sigil, INK, text)
         elif pt == "tool_batch.effect.terminal":
-            r = pl.get("record") or {}
+            r = _as_dict(pl.get("record"))
             keys = [r.get("effect_id"), r.get("call_id")]
             # Both id keys are always retired, tool_name or not: leaving one
             # behind leaks an entry per tool call for the pane's whole life.
             tool = r.get("tool_name")
             started = verb = short = None
             for key in keys:
-                if not key:
+                if not key or not isinstance(key, (str, int)):
                     continue
                 known = self.active.pop(key, None)
                 if tool is None:
@@ -314,13 +342,15 @@ class Margin:
                 if key in self.pending:
                     started, verb, short = self.pending.pop(key)
             tool = tool or "tool"
+            if not isinstance(tool, str):
+                tool = str(tool)
             observed = started is not None  # a start was actually seen
-            out = r.get("outcome") or {}
-            outcome = (out.get("kind") or "returned").lower()
+            out = _as_dict(r.get("outcome"))
+            outcome = str(out.get("kind") or "returned").lower()
             # The honest verdict can hide one level down: a "completed"
             # wrapper around a failed/cancelled terminal is still a
             # failure/interrupt, and is reported as one.
-            nested = (((out.get("task_completion") or {}).get("terminal") or {}).get("kind") or "").lower()
+            nested = str(_as_dict(_as_dict(out.get("task_completion")).get("terminal")).get("kind") or "").lower()
             # Retire the start note only when no sibling call with the same
             # text is still running (parallel calls share one display note).
             if started and not any(v[0] == started for v in self.pending.values()):
@@ -328,8 +358,8 @@ class Margin:
             disp = tool.rsplit("__", 1)[-1] if tool.startswith("mcp__") else tool
             failed = ("fail" in outcome or "error" in outcome
                       or nested in ("failed", "failure", "error"))
-            stopped = (outcome in ("cancelled", "interrupted")
-                       or nested in ("cancelled", "interrupted"))
+            stopped = (outcome in ("cancelled", "canceled", "interrupted")
+                       or nested in ("cancelled", "canceled", "interrupted"))
             if failed:
                 shown = nested if outcome == "completed" and nested else outcome
                 self.set("!", "a tool reported a problem", RED); self.note("!", RED, f"{disp} came back wrong: {shown}")
@@ -375,7 +405,11 @@ class Margin:
                     self.note("~", GREY, f"{disp} back ({outcome})")
                 if not self.pending:
                     self.set("›", "attending", INK)
-        elif pt == "runtime.session" and ev.get("operation") == "model.meta.response" and kind in ("scheduled", "started"):
+        elif pt == "runtime.session" and ev.get("operation") == "model.meta.response" and kind in ("side_effect_intent", "scheduled", "started"):
+            # The host declares a model call with side_effect_intent /
+            # operation=model.meta.response (verified against real logs);
+            # scheduled/started are kept for the shape this branch was
+            # written against, should the host return to it.
             self.set("›", "responding", INK)
         elif kind == "assistant_message_committed":
             text = ev.get("text")
@@ -472,7 +506,7 @@ def tally_text(m, width=42):
 
 
 def render(m, width, height):
-    width = max(30, width)
+    width = max(10, width)
     # Short panes (the --top running head) get the compact form: fewer page
     # rows, the kept line on one line, the last two annotations — but the
     # status line is never the thing truncated away.
@@ -638,6 +672,32 @@ def should_adopt(current_ended, current_age_s, newer_age_s):
         return True
     return current_age_s > 30 and newer_age_s < current_age_s
 
+def wait_for_session(pinned_path=None):
+    """Wait for a session log to appear; return its path or None.
+
+    `muse-margin` starts Muse and this pane at the same moment, so on a
+    fresh install (or a cleaned sessions dir) no log exists yet when the
+    pane starts. Exiting there would leave a marginless session with no
+    warning; waiting is the honest behaviour for the live pane.
+    """
+    announced = False
+    try:
+        while True:
+            if pinned_path:
+                path = pinned_path if os.path.exists(pinned_path) else None
+            else:
+                path = newest_session()
+            if path and os.path.exists(path):
+                return path
+            if not announced:
+                sys.stdout.write("· Waiting for a Muse session log… (Ctrl-C ends me)\n")
+                sys.stdout.flush()
+                announced = True
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        return None
+
+
 def follow(path, once=False, pinned=False):
     m = Margin()
     # Populate from the tail so a pane opened mid-session is not empty.
@@ -689,6 +749,13 @@ def follow(path, once=False, pinned=False):
                         carry = ""
             try:
                 cols, rows = term_size()
+                # A truncated/rotated log must not strand the pane past
+                # EOF forever: start again at the top of the new file.
+                try:
+                    if os.path.getsize(path) < offset:
+                        offset, carry = 0, ""
+                except OSError:
+                    pass
                 with open(path, encoding="utf-8", errors="ignore") as f:
                     f.seek(offset)
                     chunk = f.read()
@@ -740,8 +807,14 @@ def main():
     args = ap.parse_args()
     path = args.session or newest_session()
     if not path or not os.path.exists(path):
-        print("· No Muse session log found yet — start `muse` first, then run me.")
-        return 1
+        if args.once:
+            print("· No Muse session log found yet — start `muse` first, then run me.")
+            return 1
+        # Live pane: Muse may still be starting (muse-margin launches
+        # both together). Wait for the first log instead of dying.
+        path = wait_for_session(pinned_path=args.session)
+        if not path:
+            return 0
     follow(path, once=args.once, pinned=bool(args.session))
     return 0
 

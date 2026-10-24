@@ -64,6 +64,33 @@ class MarginKeepTest(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0)
         self.assertNotIn("let go", r.stdout)
 
+    def test_cr_bidi_and_the_tick_are_not_stored_or_shown(self):
+        r = self.raw("a\rb" + chr(0x202E) + "c " + chr(0x2713))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        with open(self.path, "rb") as f:
+            data = f.read()
+        self.assertNotIn(b"\r", data)
+        self.assertNotIn(chr(0x202E).encode(), data)
+        self.assertNotIn(chr(0x2713).encode(), data)
+        r = self.raw()
+        self.assertNotIn("\r", r.stdout)
+        self.assertNotIn(chr(0x202E), r.stdout)
+        self.assertNotIn(chr(0x2713), r.stdout)
+
+    def test_symlink_at_kept_path_is_replaced_not_followed(self):
+        victim = os.path.join(self.dir.name, "victim.txt")
+        with open(victim, "w", encoding="utf-8") as f:
+            f.write("IMPORTANT\n")
+        link = os.path.join(self.dir.name, "kept-link.txt")
+        os.symlink(victim, link)
+        r = self.raw("a kept line", path=link)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        with open(victim, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "IMPORTANT\n")  # never truncated
+        self.assertFalse(os.path.islink(link))
+        with open(link, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "a kept line\n")
+
     def test_escapes_are_not_stored_or_shown(self):
         r = self.raw("red \x1b[31m alert")
         self.assertEqual(r.returncode, 0, r.stderr)

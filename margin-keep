@@ -12,10 +12,29 @@ set -uo pipefail
 
 KEPT="${MARGIN_KEPT:-${HOME:-}/.local/share/wonder-margin/kept.txt}"
 
-# Display and storage never carry terminal control: escapes are stripped
-# on the way in, and again on the way out (in case the file was written
-# by something else), so the show-back cannot inject into your terminal.
-strip_controls() { tr -d '\001-\010\013\014\016-\037\177'; }
+# Display and storage never carry terminal control: control characters
+# (carriage return included), invisible bidi/zero-width characters, and
+# the earned `✓` are stripped on the way in, and again on the way out (in
+# case the file was written by something else), so the show-back cannot
+# inject into your terminal. Python does the Unicode work when present;
+# the tr fallback still strips every ASCII control.
+sanitize() {
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c '
+import sys
+invis = {0x200B, 0x200C, 0x200D, 0x200E, 0x200F, 0x202A, 0x202B, 0x202C,
+         0x202D, 0x202E, 0x2060, 0x2061, 0x2062, 0x2063, 0x2064, 0x00AD, 0xFEFF}
+data = sys.stdin.buffer.read().decode("utf-8", "ignore")
+data = data.replace("\n", " ").replace("\t", " ").replace("\r", " ")
+out = "".join(ch for ch in data
+              if ord(ch) >= 32 and not 127 <= ord(ch) < 160
+              and ord(ch) not in invis and ch != "✓")
+sys.stdout.write(out)
+'
+  else
+    tr '\n\t\r' ' ' | tr -d '\001-\010\013\014\016-\037\177'
+  fi
+}
 
 case "${1:-}" in
   --clear|--forget)
@@ -26,8 +45,8 @@ case "${1:-}" in
     printf '│ · kept line let go.\n'
     ;;
   "")
-    if [ -s "$KEPT" ]; then
-      printf '│ kept · “%s”\n' "$(head -n 1 "$KEPT" | strip_controls)"
+    if [ -f "$KEPT" ] && [ -s "$KEPT" ]; then
+      printf '│ kept · “%s”\n' "$(head -n 1 "$KEPT" | sanitize)"
     else
       printf '│ · nothing kept yet — margin-keep "a line worth keeping"\n'
     fi
@@ -36,7 +55,7 @@ case "${1:-}" in
     # One kept line is one line: flatten any embedded breaks/tabs to
     # spaces, strip control characters, and trim — so what is confirmed
     # is exactly what the pane will show.
-    LINE="$(printf '%s' "$*" | tr '\n\t' '  ' | strip_controls)"
+    LINE="$(printf '%s' "$*" | sanitize)"
     LINE="${LINE#"${LINE%%[![:space:]]*}"}"
     LINE="${LINE%"${LINE##*[![:space:]]}"}"
     if [ -z "$LINE" ]; then
@@ -44,7 +63,24 @@ case "${1:-}" in
       exit 1
     fi
     # The confirmation is earned: it prints only after the write lands.
-    if ! mkdir -p "$(dirname "$KEPT")" 2>/dev/null || ! printf '%s\n' "$LINE" > "$KEPT" 2>/dev/null; then
+    # The write itself is a temp file renamed over the target, so a
+    # symlink at the kept path is replaced — never followed into
+    # truncating whatever it happened to point at.
+    if [ -e "$KEPT" ] && [ ! -f "$KEPT" ]; then
+      printf '│ ! could not write %s — the line was NOT kept.\n' "$KEPT" >&2
+      exit 1
+    fi
+    KEPT_DIR="$(dirname "$KEPT")"
+    if ! mkdir -p "$KEPT_DIR" 2>/dev/null; then
+      printf '│ ! could not write %s — the line was NOT kept.\n' "$KEPT" >&2
+      exit 1
+    fi
+    TMP="$(mktemp "$KEPT_DIR/.kept.XXXXXX" 2>/dev/null)" || {
+      printf '│ ! could not write %s — the line was NOT kept.\n' "$KEPT" >&2
+      exit 1
+    }
+    if ! printf '%s\n' "$LINE" > "$TMP" 2>/dev/null || ! mv -f "$TMP" "$KEPT" 2>/dev/null; then
+      rm -f "$TMP" 2>/dev/null || true
       printf '│ ! could not write %s — the line was NOT kept.\n' "$KEPT" >&2
       exit 1
     fi

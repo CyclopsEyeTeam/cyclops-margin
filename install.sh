@@ -58,8 +58,14 @@ is_ours() { # resolved_target src
   [ "$1" = "$(canon "$2")" ] && return 0
   _d="$(dirname "$1")"
   [ -f "$1" ] && [ "$(basename "$1")" = "$(basename "$2")" ] || return 1
-  grep -q '"wonder-margin"' "$_d/.muse-plugin/plugin.json" 2>/dev/null && return 0
-  grep -q '"wonder-margin"' "$_d/../.muse-plugin/plugin.json" 2>/dev/null
+  # Another checkout of this plugin is also ours (a re-clone, a moved
+  # copy whose old path still resolves): its manifest must actually
+  # name the plugin, not merely mention the string somewhere.
+  for _manifest in "$_d/.muse-plugin/plugin.json" "$_d/../.muse-plugin/plugin.json"; do
+    [ -f "$_manifest" ] || continue
+    python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("name") == "wonder-margin" else 1)' "$_manifest" 2>/dev/null && return 0
+  done
+  return 1
 }
 check_one() {
   if [ -L "$2" ]; then

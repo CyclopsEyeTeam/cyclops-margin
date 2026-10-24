@@ -83,8 +83,11 @@ marginless. No tmux option is ever set server-wide. Piped/non-interactive
 calls pass straight through. In a short top pane Wonder takes a compact
 running-head form, so the status line survives. The dedicated-session
 launcher runs Muse through a short-lived runner file in `/tmp` (mode 700,
-self-deleting; it embeds your Muse arguments, so a hard-killed session
-can leave one behind — delete any stale `/tmp/muse-margin-run-*.sh`).
+self-deleting once Muse exits; your Muse arguments are passed to it as
+arguments, not written into it, but a hard-killed session can still leave
+the file behind — delete any stale `/tmp/muse-margin-run-*.sh`). If no
+session log exists yet when the pane starts — the normal first launch —
+the pane waits for Muse to write one instead of exiting.
 
 Inside the Muse pane, `/margin` summons Wonder's voice, and asking for
 Wonder in the terminal loads the same skill (`plugin:wonder-margin:in-the-margin`).

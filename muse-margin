@@ -67,6 +67,30 @@ while [ $# -gt 0 ]; do
   FILTERED_ARGS+=("$arg"); shift
 done
 
+# Pane geometry comes from the environment, so it is validated here:
+# a non-numeric or zero size would make tmux refuse the split — in the
+# dedicated-session path that failure would otherwise be silent.
+if ! [[ "${MARGIN_WIDTH:-42}" =~ ^[0-9]+$ ]] || [ "${MARGIN_WIDTH:-42}" -eq 0 ]; then
+  echo "│ ? MARGIN_WIDTH '${MARGIN_WIDTH:-}' is not a positive number — using 42." >&2
+  MARGIN_WIDTH=42
+fi
+if ! [[ "${MARGIN_HEIGHT:-16}" =~ ^[0-9]+$ ]] || [ "${MARGIN_HEIGHT:-16}" -eq 0 ]; then
+  echo "│ ? MARGIN_HEIGHT '${MARGIN_HEIGHT:-}' is not a positive number — using 16." >&2
+  MARGIN_HEIGHT=16
+fi
+case "$MUSE_BIN" in
+  */*)
+    if [ ! -x "$MUSE_BIN" ]; then
+      echo "│ ! muse not found or not executable: $MUSE_BIN" >&2
+      exit 127
+    fi ;;
+  *)
+    if ! command -v "$MUSE_BIN" >/dev/null 2>&1; then
+      echo "│ ! muse not found on PATH: $MUSE_BIN" >&2
+      exit 127
+    fi ;;
+esac
+
 MARGIN_CMD="$(printf '%q' "$MARGIN_PANE")"
 
 # Non-interactive (piped, scripts, dumb terminal): pass straight through.
@@ -78,6 +102,18 @@ fi
 # No tmux: Muse alone, honestly without me beside it.
 if [ -z "$TMUX_BIN" ] || [ ! -x "$TMUX_BIN" ]; then
   echo "│ ? tmux not found — Muse alone; the margin needs tmux for a side pane." >&2
+  exec "$MUSE_BIN" ${FILTERED_ARGS[@]+"${FILTERED_ARGS[@]}"}
+fi
+
+# No pane: say so and run Muse alone rather than opening a tmux
+# session whose margin dies instantly and silently.
+_pane_ok=1
+case "$MARGIN_PANE" in
+  */*) [ -x "$MARGIN_PANE" ] || _pane_ok=0 ;;
+  *) command -v "$MARGIN_PANE" >/dev/null 2>&1 || _pane_ok=0 ;;
+esac
+if [ "$_pane_ok" != "1" ]; then
+  echo "│ ? margin pane not found or not executable: $MARGIN_PANE — Muse alone." >&2
   exec "$MUSE_BIN" ${FILTERED_ARGS[@]+"${FILTERED_ARGS[@]}"}
 fi
 

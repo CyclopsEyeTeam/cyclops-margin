@@ -84,6 +84,24 @@ class InstallGuardTest(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertEqual(os.readlink(link), os.path.join("..", "stranger", "margin-keep"))
 
+    def test_manifest_that_only_mentions_the_name_is_not_ours(self):
+        # A directory whose plugin.json merely mentions "wonder-margin"
+        # (here in the description of a differently-named plugin) is
+        # not a Wonder checkout: a same-named link into it is a
+        # stranger's and must block the install, not be replaced.
+        other = os.path.join(self.dir.name, "other-plugin")
+        os.makedirs(os.path.join(other, ".muse-plugin"))
+        with open(os.path.join(other, ".muse-plugin", "plugin.json"), "w", encoding="utf-8") as f:
+            f.write('{"name": "someone-else", "description": "wonder-margin fan"}')
+        target = os.path.join(other, "muse-margin")
+        with open(target, "w", encoding="utf-8") as f:
+            f.write("someone else's tool\n")
+        link = os.path.join(self.bin, "muse-margin")
+        os.symlink(target, link)
+        r = self.run_script(INSTALL)
+        self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(os.readlink(link), target)
+
     def test_relative_link_to_this_checkout_still_refreshes(self):
         link = os.path.join(self.bin, "muse-margin")
         os.symlink(os.path.relpath(os.path.join(ROOT, "muse-margin"), self.bin), link)

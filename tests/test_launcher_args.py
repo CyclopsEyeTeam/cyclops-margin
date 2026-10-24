@@ -58,6 +58,37 @@ class LauncherArgsTest(unittest.TestCase):
         self.assertIn("muse-margin", r.stdout)
         self.assertEqual(r.returncode, 0)
 
+    def test_invalid_pane_width_falls_back_and_still_forwards(self):
+        env = dict(self.env, MARGIN_WIDTH="abc; echo PWNED")
+        with open(self.log, "w", encoding="utf-8"):
+            pass
+        r = subprocess.run([LAUNCHER, "exec", "hi"], input="x\n",
+                           capture_output=True, text=True, env=env, timeout=20)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("MARGIN_WIDTH", r.stderr)
+        with open(self.log, encoding="utf-8") as f:
+            self.assertEqual(f.read().strip(), "exec hi")
+
+    def test_shim_skips_alias_dirs_that_resolve_to_itself(self):
+        # Two different directories whose `muse` is a symlink back to
+        # the shim: judged by directory alone, the shim would bounce
+        # between them forever. Judged by resolved file, both are it.
+        alias_a = os.path.join(self.dir.name, "alias-a")
+        alias_b = os.path.join(self.dir.name, "alias-b")
+        for alias in (alias_a, alias_b):
+            os.makedirs(alias)
+            os.symlink(SHIM, os.path.join(alias, "muse"))
+        env = dict(self.env)
+        env["PATH"] = os.pathsep.join(
+            [alias_a, alias_b, self.dir.name, "/usr/bin", "/bin"])
+        with open(self.log, "w", encoding="utf-8"):
+            pass
+        r = subprocess.run([SHIM, "hello", "world"], input="x\n",
+                           capture_output=True, text=True, env=env, timeout=10)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        with open(self.log, encoding="utf-8") as f:
+            self.assertEqual(f.read().strip(), "hello world")
+
     def test_shim_never_execs_itself_via_sloppy_path(self):
         # The shim lives behind a symlink in bindir; a trailing-slash PATH
         # entry for bindir must still be recognised as the shim's own

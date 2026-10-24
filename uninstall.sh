@@ -67,8 +67,11 @@ say "· your kept line, if any, stays at ~/.local/share/wonder-margin/kept.txt �
 
 SHIM_DIR="${HOME:-}/.local/share/wonder-margin/bin"
 if [ -L "$SHIM_DIR/muse" ]; then
+  _had_shim=1
   remove_ours "$SHIM_DIR/muse" "$DIR/shim/muse"
-  [ -L "$SHIM_DIR/muse" ] || say "· removed muse shim (drop its PATH line from your shell rc if you added one)"
+  if [ -n "$_had_shim" ] && [ ! -L "$SHIM_DIR/muse" ]; then
+    say "· removed muse shim (drop its PATH line from your shell rc if you added one)"
+  fi
 fi
 
 if command -v muse >/dev/null 2>&1 && muse plugins list --json 2>/dev/null | grep -q '"wonder-margin"'; then
