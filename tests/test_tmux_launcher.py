@@ -41,8 +41,23 @@ class TmuxLauncherTest(unittest.TestCase):
             with open(stub, "w", encoding="utf-8") as f:
                 f.write("#!/bin/sh\necho STUB-MUSE-RUNNING\nsleep 60\n")
             os.chmod(stub, 0o755)
-            cmd = f"MUSE_BIN={stub} {LAUNCHER} side"
-            r = tmux("new-session", "-d", "-s", SESSION, "-x", "160", "-y", "48", cmd)
+            # A hermetic session log for the pane to follow. Without one
+            # the sidecar exits at once ("no session log yet") and the
+            # split pane dies — which is what a clean CI HOME exposed:
+            # this test used to pass only by borrowing the developer's
+            # real ~/.local/share/muse/sessions.
+            fake_home = os.path.join(d, "home")
+            log_dir = os.path.join(fake_home, ".local", "share", "muse",
+                                   "sessions", "2026", "01", "01", "deadbeef-1234")
+            os.makedirs(log_dir)
+            with open(os.path.join(log_dir, "session.jsonl"), "w", encoding="utf-8") as f:
+                f.write('{"payload_type": "session.started", "payload": {},'
+                        ' "stream": {"id": "deadbeef-1234"}}\n')
+            cmd = f"HOME={fake_home} MUSE_BIN={stub} {LAUNCHER} side"
+            # -e puts HOME in the session environment: the split margin
+            # pane inherits that, not the main pane shell's variables.
+            r = tmux("new-session", "-d", "-s", SESSION, "-x", "160", "-y", "48",
+                     "-e", f"HOME={fake_home}", cmd)
             self.assertEqual(r.returncode, 0, r.stderr)
 
             panes = ""
