@@ -6,8 +6,9 @@ set -uo pipefail
 BIN_DIR="${XDG_BIN_HOME:-${HOME:-}/.local/bin}"
 say() { printf '│ %s\n' "$*"; }
 
-rm -f "$BIN_DIR/muse-margin" "$BIN_DIR/muse-margintop"
+rm -f "$BIN_DIR/muse-margin" "$BIN_DIR/muse-margintop" "$BIN_DIR/margin-keep"
 say "· removed muse-margin links from $BIN_DIR"
+say "· your kept line, if any, stays at ~/.local/share/wonder-margin/kept.txt — it is yours, not mine to delete"
 
 SHIM_DIR="${HOME:-}/.local/share/wonder-margin/bin"
 if [ -L "$SHIM_DIR/muse" ]; then

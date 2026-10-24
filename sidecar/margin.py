@@ -10,11 +10,28 @@ Run me in a split or second terminal, beside `muse`:
 Truthfulness: I only move on events the host actually wrote to its session
 log (~/.local/share/muse/sessions/YYYY/MM/DD/<id>/session.jsonl). I never
 show prompt text, never call a returned tool a success, and go honestly
-stale ("last signal old") when the log goes quiet. Ctrl-C ends me: `·`
+stale ("last signal old") when the log goes quiet. I never draw `✓`: the log
+can prove a tool returned, never that tests passed — the tick lives only in
+Wonder's voice, after a pass was actually watched. Ctrl-C ends me: `·`
+
+Second sitting (2026-10-24): real log timestamps (`recorded_at`), branch
+marks for subagents/workflows, the compaction fold, interrupts, session
+end, a per-session tally of deeds, a kept line that is actually kept (in a
+file, across sessions — see `margin-keep`), and a compact running-head
+form for short top panes. Plus one button: `[ ⧉ copy my last message ]`
+(click it, or press `c`; `q` also leaves). The last committed answer is
+held for copying and never rendered; the button says `copied` only when a
+local clipboard tool exited cleanly, else `copy sent` for OSC52.
 """
-import argparse, glob, json, os, re, sys, time
+import argparse, base64, glob, json, os, re, select, shutil, subprocess, sys, time
+
+try:
+    import termios, tty
+except ImportError:  # non-POSIX: the pane still renders, just no clicks
+    termios = tty = None
 
 ANSI_RE = re.compile(r"\033\[[0-9;]*m")
+MOUSE_RE = re.compile(r"\033\[<(\d+);(\d+);(\d+)([Mm])")
 
 def clip(text, width):
     """Truncate by visible cells, keeping ANSI escapes intact."""
@@ -30,10 +47,18 @@ def clip(text, width):
 
 GREY = "\033[90m"; DIM = "\033[2m"; INK = "\033[1;97m"
 GREEN = "\033[32m"; AMBER = "\033[33m"; RED = "\033[31m"; RESET = "\033[0m"
-READ_TOOLS = {"read_file", "read_skill", "search", "read_memory", "web_fetch", "web_search"}
-EDIT_TOOLS = {"edit_file", "write_file", "edit_memory", "add_memory"}
-ACTIVE_STATES = {"attending", "reading", "editing", "working", "responding", "waiting for approval"}
+REV = "\033[7m"  # reverse video: the copy button, pressed
+READ_TOOLS = {"read_file", "read_skill", "search", "read_memory", "web_fetch", "web_search",
+              "subagent_status", "subagent_read_result", "work_list", "work_status",
+              "list_peer_sessions", "cron_list", "get_goal"}
+EDIT_TOOLS = {"edit_file", "write_file", "edit_memory", "add_memory", "write_todos",
+              "cron_create", "cron_delete", "create_goal", "update_goal"}
+BRANCH_TOOLS = {"subagent_spawn", "workflow"}   # work that steps out from the rule
+WATCH_TOOLS = {"monitor", "subagent_wait"}      # waiting on something real, elsewhere
+ACTIVE_STATES = {"attending", "reading", "editing", "working", "responding",
+                 "waiting for approval", "branching", "watching"}
 BLOCKS = " ▁▂▃▄▅▆▇█"
+KEPT_DEFAULT = "~/.local/share/wonder-margin/kept.txt"
 
 def subject_short(record, tool):
     """Basename the host logged, e.g. 'workspace:a/b.py' -> 'b.py'.
@@ -43,7 +68,23 @@ def subject_short(record, tool):
     """
     subj = (record.get("parallel_profile") or {}).get("subject") or ""
     name = subj.split(":", 1)[-1].rsplit("/", 1)[-1] if subj else ""
+    if not name and tool.startswith("mcp__"):
+        name = tool.rsplit("__", 1)[-1]  # mcp__server__room_read -> room_read
     return name or tool
+
+
+def event_time(record):
+    """The host's own clock: `recorded_at` is microseconds since the epoch.
+
+    History loaded from the tail keeps its real ages — the rhythm row and
+    the stale check must never pretend old marks happened just now.
+    """
+    raw = record.get("recorded_at")
+    try:
+        at = float(raw) / 1_000_000.0
+    except (TypeError, ValueError):
+        return None
+    return at if at > 1_000_000_000 else None
 
 def sparkline(stamps, n, now=None):
     """One honest history row: marks per minute, newest last."""
@@ -62,14 +103,14 @@ def newest_session():
     return max(files, key=os.path.getmtime) if files else None
 
 class Margin:
-    def __init__(self):
+    def __init__(self, kept_path=None):
         self.sigil, self.state, self.colour = "·", "resting", GREY
         self.notes = []          # (sigil, colour, text), newest last
         self.marks = 0           # events observed this session
         self.page_pos = 0        # where my mark sits on the page
         self.last_signal = time.time()
         self.session = "—"
-        self.model = "muse-wonder-1.0"
+        self.model = "muse-wonder-full-1.0"
         self.stale = False
         self.active = {}         # effect/call id -> tool name, for honest returns
         self.pending = {}        # effect/call id -> start-note text, collapsed on return
@@ -78,6 +119,37 @@ class Margin:
         self.breathe = False     # approval-wait pulse phase; True only while genuinely waiting
         self.detail = ""         # what the mark is doing, e.g. the file it sits in
         self.state_since = time.time()  # when the current state began, for the live clock
+        self._at = None          # host time of the record being fed, if it carried one
+        # Deeds actually returned this session, tallied at the page foot.
+        self.tally = {"read": 0, "edited": 0, "ran": 0, "branched": 0, "waited": 0}
+        # A line kept: chosen on purpose (margin-keep), kept in a file so it
+        # survives the session. The pane only ever reads it.
+        self.kept_path = kept_path if kept_path is not None else os.path.expanduser(
+            os.environ.get("MARGIN_KEPT") or KEPT_DEFAULT)
+        self._kept_cache = (None, "")  # (mtime, text)
+        # The last committed answer, held for the copy button. Held, never
+        # rendered: the pane shows marks, the clipboard gets the words.
+        self.last_answer = ""
+        self.button = None       # (row, col0, col1) 0-based, set by render()
+        self.copy_feedback = ""  # transient button label after a click
+        self.copy_until = 0.0    # feedback shown until this time; never a mark
+
+    def kept_text(self):
+        try:
+            mtime = os.path.getmtime(self.kept_path)
+        except OSError:
+            return ""
+        if self._kept_cache[0] != mtime:
+            try:
+                with open(self.kept_path, encoding="utf-8", errors="ignore") as f:
+                    text = next((ln.strip() for ln in f if ln.strip()), "")
+            except OSError:
+                text = ""
+            self._kept_cache = (mtime, text)
+        return self._kept_cache[1]
+
+    def _now(self):
+        return self._at if self._at is not None else time.time()
 
     def note(self, sigil, colour, text):
         if self.notes and self.notes[-1][2] == text:
@@ -86,7 +158,7 @@ class Margin:
         self.notes = self.notes[-5:]
         self.marks += 1
         self.page_pos += 1
-        self.last_signal = time.time()
+        self.last_signal = self._now()
         self.stale = False
         self.stamps.append(self.last_signal)
         self.stamps = self.stamps[-720:]
@@ -96,9 +168,10 @@ class Margin:
     def set(self, sigil, state, colour, detail=""):
         self.sigil, self.state, self.colour = sigil, state, colour
         self.detail = detail
-        self.state_since = time.time()
+        self.state_since = self._now()
 
     def feed(self, rec):
+        self._at = event_time(rec)
         pt = rec.get("payload_type") or ""
         pl = rec.get("payload") or {}
         ev = pl.get("event") or {}
@@ -107,6 +180,10 @@ class Margin:
             sid = (rec.get("stream") or {}).get("id", "")
             self.session = sid[:8] if sid else self.session
             self.set("·", "resting", GREY); self.note("·", GREY, "session opened — present, nothing claimed")
+        elif pt == "session.end":
+            reason = (pl.get("record") or {}).get("exit_reason") or "ended"
+            self.set("·", f"ended ({reason})", GREY)
+            self.note("·", GREY, f"session ended ({reason}) — marks left as they stand")
         elif pt == "run.model.configured":
             label = (pl.get("record") or {}).get("display_label")
             if label: self.model = label
@@ -114,10 +191,30 @@ class Margin:
             self.set("›", "attending", INK); self.note("›", INK, "prompt received (text never shown here)")
         elif pt == "approval_wait.effect.started":
             tool = (pl.get("record") or {}).get("tool_name", "a tool")
+            self.tally["waited"] += 1
             self.set("?", "waiting for approval", AMBER); self.note("?", AMBER, f"approval asked — {tool} held")
         elif pt == "approval_wait.effect.terminal":
             outcome = ((pl.get("record") or {}).get("outcome") or {}).get("kind", "settled")
             self.set("›", "attending", INK); self.note("›", INK, f"approval {outcome}")
+        elif pt == "subagent.control.spawn_accepted":
+            self.set("⌥", "branching", INK); self.note("⌥", INK, "branch opened — a subagent steps out")
+        elif pt == "subagent.control.result_ready":
+            self.tally["branched"] += 1
+            self.note("⌥", GREY, "branch back — subagent result ready")
+        elif kind == "workflow_child_lifecycle":
+            # Only the edges are marks; usage/terminal bookkeeping is not.
+            label = ev.get("label") or "workflow child"
+            if ev.get("status") == "started":
+                self.set("⌥", "branching", INK, detail=label)
+                self.note("⌥", INK, f"branch — {label}")
+            elif ev.get("status") == "completed":
+                self.tally["branched"] += 1
+                self.note("⌥", GREY, f"branch back — {label}")
+        elif kind == "context_compaction_installed":
+            # A candidate is not a fold. Only the installed fold is claimed,
+            # and nothing is claimed about what it kept or lost.
+            self.set("¦", "folded — context compacted", GREY)
+            self.note("¦", GREY, "fold — context compacted; contents not claimed")
         elif pt == "tool_batch.effect.started":
             r0 = pl.get("record") or {}
             tool = r0.get("tool_name", "tool")
@@ -125,6 +222,10 @@ class Margin:
                 verb, sigil = "reading", "§"
             elif tool in EDIT_TOOLS:
                 verb, sigil = "editing", "✎"
+            elif tool in BRANCH_TOOLS:
+                verb, sigil = "branching", "⌥"
+            elif tool in WATCH_TOOLS:
+                verb, sigil = "watching", "~"
             else:
                 verb, sigil = "working", "~"
             # The read head names the file the host logged. The log carries
@@ -144,31 +245,134 @@ class Margin:
             for key in keys:
                 if key and key in self.pending:
                     started, verb, short = self.pending.pop(key)
-            outcome = ((r.get("outcome") or {}).get("kind") or "returned").lower()
-            if "fail" in outcome or "error" in outcome:
-                self.set("!", "a tool reported a problem", RED); self.note("!", RED, f"{tool} came back wrong: {outcome}")
+            out = r.get("outcome") or {}
+            outcome = (out.get("kind") or "returned").lower()
+            # The honest verdict can hide one level down: a "completed"
+            # wrapper around a failed/cancelled terminal is still a
+            # failure/interrupt, and is reported as one.
+            nested = (((out.get("task_completion") or {}).get("terminal") or {}).get("kind") or "").lower()
+            if started:
+                self.notes = [n for n in self.notes if n[2] != started]
+            disp = tool.rsplit("__", 1)[-1] if tool.startswith("mcp__") else tool
+            if "fail" in outcome or "error" in outcome or nested == "failed":
+                shown = nested if outcome == "completed" and nested else outcome
+                self.set("!", "a tool reported a problem", RED); self.note("!", RED, f"{disp} came back wrong: {shown}")
+            elif outcome == "cancelled" or nested == "cancelled":
+                self.set("—", "interrupted", AMBER); self.note("—", AMBER, f"{disp} interrupted (cancelled)")
             else:
                 # A return is a return — never a success verdict. It replaces
                 # its start note, so one tool leaves one line, not two. Each
                 # kind of work gets its own closing voice; the outcome in
-                # brackets stays literal, never dressed up.
-                if started:
-                    self.notes = [n for n in self.notes if n[2] != started]
+                # brackets stays literal, never dressed up. Only a clean
+                # return earns a tally stroke.
                 if verb == "reading":
+                    self.tally["read"] += 1
                     self.note("§", GREY, f"{short or tool} closed ({outcome})")
                 elif verb == "editing":
+                    self.tally["edited"] += 1
                     self.note("✎", GREY, f"{short or tool} marked ({outcome})")
+                elif verb == "branching":
+                    self.tally["branched"] += 1
+                    self.note("⌥", GREY, f"branch back ({outcome})")
+                elif verb == "watching":
+                    self.note("~", GREY, f"{disp} watch ended ({outcome})")
                 else:
-                    self.note("~", GREY, f"{tool} back ({outcome})")
+                    self.tally["ran"] += 1
+                    self.note("~", GREY, f"{disp} back ({outcome})")
         elif pt == "runtime.session" and ev.get("operation") == "model.meta.response" and kind in ("scheduled", "started"):
             self.set("›", "responding", INK)
         elif kind == "assistant_message_committed":
+            text = ev.get("text")
+            if isinstance(text, str) and text.strip():
+                self.last_answer = text
             self.set("·", "resting — answer held in the main pane", GREY)
             self.note("·", GREY, "answer committed; back to stillness")
+        self._at = None
+
+def deliver_copy(text, emit):
+    """Hand `text` to a clipboard. Returns "copied" only when a local
+    clipboard tool exited cleanly (checked), else "sent" after emitting
+    OSC52 — the terminal/tmux may honour it, but nothing confirms back,
+    so the button may never claim more than that."""
+    for cmd in (["wl-copy"], ["xclip", "-selection", "clipboard"],
+                ["xsel", "--clipboard", "--input"], ["pbcopy"]):
+        exe = shutil.which(cmd[0])
+        if not exe:
+            continue
+        try:
+            subprocess.run([exe] + cmd[1:], input=text.encode(), timeout=5,
+                           check=True, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL)
+            return "copied"
+        except Exception:
+            pass
+    payload = base64.b64encode(text.encode()).decode()
+    emit(f"\033]52;c;{payload}\a")
+    return "sent"
+
+
+def do_copy(m, deliver=None, emit=None):
+    """The button, pressed. Feedback lives on the button for a few seconds
+    and nowhere else: a click is a pane-local act, never a host mark."""
+    if not m.last_answer:
+        m.copy_feedback, m.copy_until = "⧉ nothing yet", time.time() + 2.5
+        return "nothing"
+    deliver = deliver or deliver_copy
+    emit = emit or (lambda s: (sys.stdout.write(s), sys.stdout.flush()))
+    outcome = deliver(m.last_answer, emit)
+    m.copy_feedback = "⧉ copied" if outcome == "copied" else "⧉ copy sent"
+    m.copy_until = time.time() + 2.5
+    return outcome
+
+
+def parse_input(data):
+    """Terminal input -> intent. SGR mouse presses (not releases, not
+    motion), `c`/`y` to copy, Ctrl-C / `q` to leave. 1-based cells."""
+    events = []
+    for b, x, y, final in MOUSE_RE.findall(data):
+        if final == "M" and not (int(b) & 32) and int(b) & 3 != 3:
+            events.append(("click", int(x), int(y)))
+    rest = MOUSE_RE.sub("", data)
+    for ch in rest:
+        if ch in "cCyY":
+            events.append(("copy",))
+        elif ch in ("\x03", "q", "Q"):
+            events.append(("quit",))
+    return events
+
+
+def hit_button(m, x, y):
+    """1-based terminal cell against the last rendered button geometry."""
+    if not m.button:
+        return False
+    row, col0, col1 = m.button
+    return y - 1 == row and col0 <= x - 1 <= col1
+
+
+def tally_text(m, width=42):
+    # The tally shortens gracefully — prefix, then words, then bare counts —
+    # rather than ever being clipped mid-word at the pane edge.
+    keys = ("read", "edited", "ran", "branched", "waited")
+    words = [f"{s} {w} {m.tally[k]}" for s, w, k in
+             zip("§✎~⌥?", keys, keys) if m.tally[k]]
+    if not words:
+        return ""
+    full = "this session · " + " · ".join(words)
+    if len(full) + 1 <= width:
+        return full
+    bare = " · ".join(words)
+    if len(bare) + 1 <= width:
+        return bare
+    return " · ".join(f"{s}{m.tally[k]}" for s, k in zip("§✎~⌥?", keys) if m.tally[k])
+
 
 def render(m, width, height):
     width = max(30, width)
-    page_rows = max(6, min(18, height - 22))
+    # Short panes (the --top running head) get the compact form: fewer page
+    # rows, the kept line on one line, the last two annotations — but the
+    # status line is never the thing truncated away.
+    compact = height <= 18
+    page_rows = 3 if compact else max(6, min(18, height - 25))
     age = int(time.time() - m.last_signal)
     stale = age > 300
     sigil, colour, state = (m.sigil, m.colour, m.state)
@@ -184,17 +388,19 @@ def render(m, width, height):
     tick = f"{RED}━━{RESET}" if needs_eyes else f"{GREY}──{RESET}"
     lines.append(f"   {GREY}│{RESET}   {INK}WONDER{RESET} {GREY}· in the margin{RESET}")
     lines.append(f"   {GREY}│{tick} {DIM}{m.model} · session {m.session} · {m.marks} marks observed{RESET}")
-    lines.append("")
+    if not compact:
+        lines.append("")
     pos = m.page_pos % page_rows if page_rows else 0
     now = time.time()
-    # The comet's tail: past marks cooling where they stood. Newest echo
-    # per row wins; the head row is never overwritten. Fading is by real
-    # age — under ten seconds bright, older dim, nothing invented.
+    # The comet's tail: past marks cooling where they stood — on this page
+    # only. When the mark wraps, the page has turned; older echoes do not
+    # bleed through from the page before. Newest echo per row wins; the
+    # head row is never overwritten. Fading is by real age.
     echoes = {}
+    page_base = m.page_pos - pos
     for idx, sg, t in m.trail:
-        if idx == m.page_pos:
-            continue
-        echoes[idx % page_rows if page_rows else 0] = (sg, now - t)
+        if page_base <= idx < m.page_pos:
+            echoes[idx - page_base] = (sg, now - t)
     for i in range(page_rows):
         # The page fills as the mark descends: solid where it has been,
         # dotted where it has not. Honest position, not decoration.
@@ -208,7 +414,8 @@ def render(m, width, height):
             lines.append(f"   {fade}│{sg}{RESET}  {DIM}{rule}{RESET}")
         else:
             lines.append(f"   {GREY}│{RESET}  {DIM}{rule}{RESET}")
-    lines.append(f"   {GREY}│{RESET}")
+    if not compact:
+        lines.append(f"   {GREY}│{RESET}")
     # The one honest animation: while approval is genuinely outstanding the
     # dot breathes, slowly, between amber and dim. Nothing else moves.
     dot = (AMBER if m.breathe else DIM) if state == "waiting for approval" else colour
@@ -218,19 +425,42 @@ def render(m, width, height):
     lines.append(f" {dot}●{RESET}  {INK}Wonder{RESET} {GREY}· {state}{clock}{RESET}")
     lines.append(f" {DIM}last signal {age}s ago — no new host event{RESET}")
     lines.append(f" {DIM}rhythm {sparkline(m.stamps, min(32, max(10, width - 16)))}{RESET}")
-    if m.notes:
-        s, c, text = m.notes[-1]
+    tally = tally_text(m, width)
+    if tally:
+        lines.append(f" {DIM}{tally}{RESET}")
+    # The one button in the margin: copies the last committed answer.
+    # Ink when there is something to copy, dim when there is not, reversed
+    # while its brief feedback shows. Geometry is recorded for mouse hits.
+    if time.time() < m.copy_until and m.copy_feedback:
+        label, btn_colour = m.copy_feedback, REV + INK
+    elif m.last_answer:
+        label, btn_colour = "⧉ copy my last message", INK
+    else:
+        label, btn_colour = "⧉ copy my last message · none yet", DIM
+    btn = f"[ {label} ]"
+    hint = f" {DIM}(click or c){RESET}" if 1 + len(btn) + 13 <= width else ""
+    lines.append(f" {btn_colour}{btn}{RESET}{hint}")
+    m.button = (len(lines) - 1, 1, len(btn))
+    # A line kept is kept on purpose, in a file, across sessions
+    # (margin-keep). No file, no box — the newest note is not dressed up
+    # as something cherished.
+    kept = m.kept_text()
+    if kept and compact:
+        lines.append(f" {GREY}kept ·{RESET} “{kept}”")
+    elif kept:
         box_w = max(20, width - 6)
-        inner = ("“" + text + "”")[:box_w]
+        inner = ("“" + kept + "”")[:box_w]
         lines.append("")
         lines.append(clip(f" {GREY}╭─ a line kept {'─' * max(0, box_w - 14)}╮{RESET}", width))
-        lines.append(f" {GREY}│{RESET} {c}{s}{RESET} {inner}")
+        lines.append(f" {GREY}│{RESET} {inner}")
         lines.append(clip(f" {GREY}╰{'─' * box_w}╯{RESET}", width))
-    lines.append("")
+    if not compact:
+        lines.append("")
     lines.append(f" {GREY}── annotations (newest last) ──{RESET}")
-    for s, c, text in m.notes:
+    for s, c, text in (m.notes[-2:] if compact else m.notes):
         lines.append(f"  {c}│{s}{RESET} {text}")
-    lines.append("")
+    if not compact:
+        lines.append("")
     lines.append(f" {DIM}talk in Muse pane → · Ctrl-C ends me{RESET}")
     return "\n".join(clip(line, width) for line in lines[:height])
 
@@ -266,6 +496,18 @@ def follow(path, once=False, pinned=False):
     last_draw = ""
     last_check = 0.0
     last_breathe = 0.0
+    # A real terminal gets a clickable button (SGR mouse) and keys; a pipe
+    # gets exactly the old behaviour. The terminal is always restored.
+    interactive = bool(termios and sys.stdin.isatty() and sys.stdout.isatty())
+    old_tty = None
+    if interactive:
+        try:
+            old_tty = termios.tcgetattr(sys.stdin.fileno())
+            tty.setcbreak(sys.stdin.fileno())
+            sys.stdout.write("\033[?1000h\033[?1006h")
+            sys.stdout.flush()
+        except Exception:
+            interactive, old_tty = False, None
     try:
         while True:
             # Unless pinned to one log, adopt a newer session when one starts
@@ -304,10 +546,27 @@ def follow(path, once=False, pinned=False):
                 sys.stdout.write("\033[H" + frame.replace("\n", "\033[K\n") + "\033[K\033[J")
                 sys.stdout.flush()
                 last_draw = frame
-            time.sleep(0.25)
+            if interactive:
+                ready, _, _ = select.select([sys.stdin], [], [], 0.25)
+                if ready:
+                    data = os.read(sys.stdin.fileno(), 4096).decode("utf-8", "ignore")
+                    for event in parse_input(data):
+                        if event[0] == "quit":
+                            raise KeyboardInterrupt
+                        if event[0] == "copy" or (
+                                event[0] == "click" and hit_button(m, event[1], event[2])):
+                            do_copy(m)
+                            last_draw = ""  # show the pressed button at once
+            else:
+                time.sleep(0.25)
     except KeyboardInterrupt:
         pass
     finally:
+        if interactive:
+            sys.stdout.write("\033[?1006l\033[?1000l")
+        if old_tty is not None:
+            try: termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old_tty)
+            except Exception: pass
         sys.stdout.write(f"\033[?25h\n{GREY}· Wonder has left the margin.{RESET}\n")
 
 def main():

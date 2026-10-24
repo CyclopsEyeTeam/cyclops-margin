@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# margin-keep — keep one line in Wonder's margin, across sessions.
+#
+#   margin-keep "the line worth keeping"   keep it (shown in the pane's box)
+#   margin-keep                            show what is kept, if anything
+#   margin-keep --clear                    let it go
+#
+# One line only: a margin keeps a line, not a journal. Stored as plain text
+# at ${MARGIN_KEPT:-~/.local/share/wonder-margin/kept.txt}; the sidecar pane
+# only ever reads that file.
+set -uo pipefail
+
+KEPT="${MARGIN_KEPT:-${HOME:-}/.local/share/wonder-margin/kept.txt}"
+
+case "${1:-}" in
+  --clear|--forget)
+    rm -f "$KEPT"
+    printf '│ · kept line let go.\n'
+    ;;
+  "")
+    if [ -s "$KEPT" ]; then
+      printf '│ kept · “%s”\n' "$(head -n 1 "$KEPT")"
+    else
+      printf '│ · nothing kept yet — margin-keep "a line worth keeping"\n'
+    fi
+    ;;
+  *)
+    mkdir -p "$(dirname "$KEPT")"
+    printf '%s\n' "$*" > "$KEPT"
+    printf '│ kept · “%s”\n' "$*"
+    ;;
+esac

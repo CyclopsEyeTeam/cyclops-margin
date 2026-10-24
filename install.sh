@@ -43,6 +43,7 @@ fi
 mkdir -p "$BIN_DIR"
 ln -sfn "$DIR/muse-margin" "$BIN_DIR/muse-margin"
 ln -sfn "$DIR/muse-margin" "$BIN_DIR/muse-margintop"
+ln -sfn "$DIR/margin-keep" "$BIN_DIR/margin-keep"
 say "✓ linked $BIN_DIR/muse-margin"
 
 if [ "$WITH_SHIM" = "1" ]; then
@@ -63,3 +64,4 @@ esac
 say "✓ done. Open a new terminal and type:  muse-margin"
 say "  side is default · muse-margintop (or muse-margin --top) puts me on top"
 say "  inside the Muse pane, /margin summons my voice"
+say "  margin-keep \"a line worth keeping\" keeps one line in my pane, across sessions"
