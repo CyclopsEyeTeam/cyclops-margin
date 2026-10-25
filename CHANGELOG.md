@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.3.4 — 2026-10-25
+
+The margin hosts a visitor. Cyclops Sideview (`cyclops-sideview-muse`),
+the passive side view that leaves tips for the person to pass to the
+builder, can now display in the pane too.
+
+- New `from the side · Cyclops Sideview` box below the annotations,
+  showing the latest tip from Sideview's tips log
+  (`~/.local/state/cyclops-sideview-muse/tips.md`;
+  `MARGIN_SIDEVIEW_TIPS` overrides, `CYCLOPS_SIDEVIEW_MUSE_DATA_DIR`
+  honoured). The pane only reads the file; Sideview owns writing it.
+- The side's words are a guest's comment, never a mark: no tally
+  stroke, no annotation, cleaned like any untrusted text (control and
+  invisible characters stripped, markdown links collapsed to their
+  label, the earned `✓` unborrowable). No tips log, no box.
+- The box sits last in the frame, so a short pane sacrifices the
+  visitor before it sacrifices the record. In the compact top form it
+  is one `◐ side ·` line.
+
 ## 0.3.3 — 2026-10-25
 
 Third fresh-eyes pass: two dead-or-dying paths found against the real

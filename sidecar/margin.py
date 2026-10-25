@@ -17,8 +17,10 @@ Wonder's voice, after a pass was actually watched. Ctrl-C ends me: `·`
 Second sitting (2026-10-24): real log timestamps (`recorded_at`), branch
 marks for subagents/workflows, the compaction fold, interrupts, session
 end, a per-session tally of deeds, a kept line that is actually kept (in a
-file, across sessions — see `margin-keep`), and a compact running-head
-form for short top panes. Plus one button: `[ ⧉ copy my last message ]`
+file, across sessions — see `margin-keep`), a compact running-head
+form for short top panes, and a `from the side` box showing Cyclops
+Sideview's latest tip (its tips log, read-only here; absent, no box).
+Plus one button: `[ ⧉ copy my last message ]`
 (click it, or press `c`; `q` also leaves). The last committed answer is
 held for copying and never rendered; the button says `copied` only when a
 local clipboard tool exited cleanly, else `copy sent` for OSC52.
@@ -104,6 +106,73 @@ ACTIVE_STATES = {"attending", "reading", "editing", "working", "responding",
 BLOCKS = " ▁▂▃▄▅▆▇█"
 KEPT_DEFAULT = "~/.local/share/wonder-margin/kept.txt"
 
+def sideview_tips_default():
+    """Where Cyclops Sideview leaves its tips log (its own default).
+
+    The pane only ever reads this file; Sideview owns writing it. No
+    file, no box — the margin never invents a side comment.
+    """
+    override = os.environ.get("CYCLOPS_SIDEVIEW_MUSE_DATA_DIR")
+    if override:
+        return os.path.join(os.path.expanduser(override), "tips.md")
+    xdg = os.environ.get("XDG_STATE_HOME")
+    base = os.path.expanduser(xdg) if xdg else os.path.expanduser("~/.local/state")
+    return os.path.join(base, "cyclops-sideview-muse", "tips.md")
+
+
+def latest_sideview_tip(text):
+    """The newest tip from a Sideview tips log, cleaned for rendering.
+
+    The log is a series of `## …` sections; each new tip appends one.
+    Only the latest is the side's current word. Markdown links collapse
+    to their label, backticks go, and every line passes `clean` — the
+    side's text is data here, never terminal control, and may not
+    borrow the earned `✓`.
+    """
+    sections, current = [], []
+    for line in str(text).splitlines():
+        if line.startswith("## "):
+            if current:
+                sections.append(current)
+            current = [line]
+        elif current:
+            current.append(line)
+    if current:
+        sections.append(current)
+    if not sections:
+        return ""
+    body = sections[-1][1:]
+    while body and not body[0].strip():
+        body.pop(0)
+    if body and body[0].startswith("Watched:"):
+        body.pop(0)
+        while body and not body[0].strip():
+            body.pop(0)
+    out = []
+    for line in body:
+        line = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", line).replace("`", "")
+        out.append(clean(line).rstrip())
+    return "\n".join(out).strip()
+
+
+def wrap_text(text, width):
+    """Word-wrap plain text to `width` cells (approximate, honest)."""
+    lines = []
+    for para in str(text).splitlines():
+        words, cur = para.split(), ""
+        if not words:
+            continue
+        for word in words:
+            trial = f"{cur} {word}".strip()
+            if cur and display_width(trial) > width:
+                lines.append(cur)
+                cur = word
+            else:
+                cur = trial
+        if cur:
+            lines.append(cur)
+    return lines
+
 def subject_short(record, tool):
     """Basename the host logged, e.g. 'workspace:a/b.py' -> 'b.py'.
 
@@ -161,7 +230,7 @@ def newest_session():
     return newest
 
 class Margin:
-    def __init__(self, kept_path=None):
+    def __init__(self, kept_path=None, sideview_path=None):
         self.sigil, self.state, self.colour = "·", "resting", GREY
         self.notes = []          # (sigil, colour, text), newest last
         self.marks = 0           # events observed this session
@@ -188,6 +257,12 @@ class Margin:
         self.kept_path = kept_path if kept_path is not None else os.path.expanduser(
             os.environ.get("MARGIN_KEPT") or KEPT_DEFAULT)
         self._kept_cache = (None, "")  # (mtime, text)
+        # The side's latest word: Cyclops Sideview's tips log, read-only
+        # here. It is a visitor's comment, never a mark: it earns no
+        # tally stroke, no annotation, and no ✓.
+        self.sideview_path = sideview_path if sideview_path is not None else os.path.expanduser(
+            os.environ.get("MARGIN_SIDEVIEW_TIPS") or sideview_tips_default())
+        self._sideview_cache = (None, "")  # (mtime, latest tip)
         # The last committed answer, held for the copy button. Held, never
         # rendered: the pane shows marks, the clipboard gets the words.
         self.last_answer = ""
@@ -208,6 +283,20 @@ class Margin:
                 text = ""
             self._kept_cache = (mtime, text)
         return self._kept_cache[1]
+
+    def sideview_tip(self):
+        try:
+            mtime = os.path.getmtime(self.sideview_path)
+        except OSError:
+            return ""
+        if self._sideview_cache[0] != mtime:
+            try:
+                with open(self.sideview_path, encoding="utf-8", errors="ignore") as f:
+                    text = latest_sideview_tip(f.read())
+            except OSError:
+                text = ""
+            self._sideview_cache = (mtime, text)
+        return self._sideview_cache[1]
 
     def _now(self):
         return self._at if self._at is not None else time.time()
@@ -602,6 +691,23 @@ def render(m, width, height):
     lines.append(f" {GREY}── annotations (newest last) ──{RESET}")
     for s, c, text in (m.notes[-2:] if compact else m.notes):
         lines.append(f"  {c}│{s}{RESET} {text}")
+    # From the side: Cyclops Sideview's latest tip, shown as a visitor's
+    # comment below the annotations. Attributed, wrapped, and never a
+    # mark — it is not added to the annotations, earns no tally stroke,
+    # and (cleaned on the way in) may not borrow the earned ✓. No tips
+    # log, no box. It sits last so a short frame sacrifices the visitor
+    # before it sacrifices the record.
+    side = m.sideview_tip()
+    if side and compact:
+        first = side.splitlines()[0] if side.splitlines() else ""
+        lines.append(f" {GREY}◐ side ·{RESET} “{first}”")
+    elif side:
+        box_w = max(20, width - 6)
+        lines.append("")
+        lines.append(clip(f" {GREY}╭─ from the side · Cyclops Sideview {'─' * max(0, box_w - 34)}╮{RESET}", width))
+        for wrapped in wrap_text(side, box_w)[:6]:
+            lines.append(f" {GREY}│{RESET} {wrapped}")
+        lines.append(clip(f" {GREY}╰{'─' * box_w}╯{RESET}", width))
     if not compact:
         lines.append("")
     lines.append(f" {DIM}talk in Muse pane → · Ctrl-C ends me{RESET}")

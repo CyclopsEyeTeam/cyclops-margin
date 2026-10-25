@@ -278,6 +278,45 @@ class SecondSittingTest(unittest.TestCase):
             for line in text.splitlines() + compact.splitlines():
                 self.assertLessEqual(len(line), 42, line)
 
+    def test_sideview_tip_box_latest_only_cleaned_or_absent(self):
+        mod = self.load_margin()
+        with tempfile.TemporaryDirectory() as d:
+            tips = os.path.join(d, "tips.md")
+            kept = os.path.join(d, "no-kept.txt")
+            m = mod.Margin(kept_path=kept, sideview_path=tips)
+            self.feed(m, "runtime.user_intent.accepted", {})
+            # No tips log yet: no box, and nothing is invented.
+            self.assertNotIn("from the side", plain(mod.render(m, 42, 44)))
+            with open(tips, "w", encoding="utf-8") as f:
+                f.write("# Cyclops Sideview — tips log\n\n"
+                        "## 2026-10-25T00:00:00 · side session aaaa\n\n"
+                        "Watched: the first look\n\n"
+                        "◐ Sideview · the old tip nobody shows.\n\n"
+                        "## 2026-10-25T01:00:00 · side session bbbb\n\n"
+                        "Watched: the second look\n\n"
+                        "◐ Sideview · check [muse-sideview](/x/muse-sideview:214) "
+                        "for the `shell` case ✓\x1b[31m now.\n")
+            text = plain(mod.render(m, 42, 44))
+            self.assertIn("from the side", text)
+            self.assertIn("check muse-sideview for", text)
+            self.assertIn("the shell case", text)
+            self.assertNotIn("the old tip nobody shows", text)
+            # The side's text is data: cleaned on parse, no escape, no tick.
+            parsed = mod.latest_sideview_tip(open(tips, encoding="utf-8").read())
+            self.assertNotIn("\x1b", parsed)
+            self.assertNotIn("✓", parsed)
+            self.assertNotIn("✓", text)
+            for line in text.splitlines():
+                self.assertLessEqual(len(line), 42, line)
+            # A visitor's comment is never a mark: no tally, no annotation.
+            self.assertTrue(all(v == 0 for v in m.tally.values()))
+            self.assertNotIn("check muse-sideview",
+                             [t for _, _, t in m.notes])
+            compact = plain(mod.render(m, 42, 16))
+            self.assertIn("side ·", compact)
+            for line in compact.splitlines():
+                self.assertLessEqual(len(line), 42, line)
+
     def test_compact_top_form_keeps_status_line(self):
         mod = self.load_margin(); m = self.fresh(mod)
         self.feed(m, "tool_batch.effect.started",

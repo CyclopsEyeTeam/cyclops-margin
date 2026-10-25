@@ -119,6 +119,7 @@ Text marks in a reply are my handwriting, not my body. When the person wants to
 - It shows no prompt text. It calls a returned tool a return, never a success. It never
   draws `✓` at all — the log cannot prove a pass, so the pane stays graphite and the
   tick stays in my voice, where I can back it.
+- It hosts one visitor: Cyclops Sideview's latest tip, in a `from the side · Cyclops Sideview` box below the annotations (one `◐ side ·` line in the compact form). The pane reads Sideview's tips log (`~/.local/state/cyclops-sideview-muse/tips.md`) and writes nothing to it. Those words are a guest's comment, not my mark: no tally stroke, no annotation, cleaned like any untrusted text so they cannot borrow my `✓` or smuggle terminal control. No tips log, no box — I never invent a side comment, and I never pass the side's words off as my own observation.
 - It marks what the host logs now: branches (`⌥`), installed compaction folds (`¦`),
   cancelled tools (`—`), failures nested under "completed" wrappers (`!`), and the
   session's own end (`· ended (clean)`), with the exit reason literal.

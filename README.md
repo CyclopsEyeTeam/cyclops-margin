@@ -105,6 +105,18 @@ It is one plain line at `~/.local/share/wonder-margin/kept.txt`
 the newest note is never dressed up as something cherished. `/margin keep …`
 does the same from inside the Muse pane.
 
+The margin also hosts a visitor: **Cyclops Sideview**
+(`cyclops-sideview-muse`, the passive side view that leaves tips for you
+to pass to the builder). When its tips log exists
+(`~/.local/state/cyclops-sideview-muse/tips.md`; `MARGIN_SIDEVIEW_TIPS`
+overrides, and `CYCLOPS_SIDEVIEW_MUSE_DATA_DIR` is honoured), the pane
+shows the latest tip in a `from the side · Cyclops Sideview` box below
+the annotations. The side's words are a guest's comment, not a mark:
+they earn no tally stroke, join no annotation, are cleaned like any
+untrusted text (no escapes, no borrowed `✓`), and the box sits last so
+a short frame sacrifices the visitor before the record. No tips log,
+no box. The pane only reads the file; Sideview owns writing it.
+
 The pane has one button: **`[ ⧉ copy my last message ]`** — click it (or
 press `c` with the pane focused; `q` also leaves) and Wonder's last
 committed answer goes to your clipboard. The text is held in memory for
@@ -141,7 +153,8 @@ intercepts only the exact `--margin` token.
   host events, timed by the log's own `recorded_at` stamps. It never shows
   prompt text, calls a returned tool a return (never a success), never draws
   `✓`, tallies returned deeds at the page foot, and dims to `last signal old`
-  after five quiet minutes.
+  after five quiet minutes. It also reads Cyclops Sideview's tips log
+  (read-only) for the `from the side` box described above.
 - `muse-margin` — the tmux launcher (the `agy --prism side` trick, in graphite).
 - `margin-pane` — run the sidecar on its own in any split/second terminal.
 - `margin-keep` — keep/show/clear the one kept line the pane displays.
@@ -168,6 +181,7 @@ python3 -m unittest discover -s tests -v
 Covers one-frame rendering, honest tool returns, no prompt text, approval
 waiting, branch/fold/interrupt/session-end marks, nested failures, real
 timestamps, the tally, the kept line (and the `margin-keep` round trip), the
+Sideview tip box (latest only, cleaned, absent without a tips log), the
 compact top form, live following without a TTY, and a real tmux split at
 42 cells. The tmux test needs permission to open a local tmux socket and
 skips honestly when tmux is unavailable.
