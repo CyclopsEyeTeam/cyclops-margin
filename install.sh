@@ -31,7 +31,7 @@ usage() {
 │   ./install.sh --with-muse-shim   also link the `muse --margin` shim
 │   ./install.sh --help             this text (installs nothing)
 │
-│ Links muse-margin, muse-margintop, margin-pane and margin-keep into
+│ Links muse-margin, muse-margintop, margin-pane, margin-keep and muse-sideview into
 │ ~/.local/bin (or $XDG_BIN_HOME). The links point into this checkout —
 │ keep the folder where it is after installing.
 EOF
@@ -84,11 +84,38 @@ check_one "$DIR/muse-margin" "$BIN_DIR/muse-margin"
 check_one "$DIR/muse-margin" "$BIN_DIR/muse-margintop"
 check_one "$DIR/margin-pane" "$BIN_DIR/margin-pane"
 check_one "$DIR/margin-keep" "$BIN_DIR/margin-keep"
+check_one "$DIR/muse-sideview" "$BIN_DIR/muse-sideview"
 [ "$WITH_SHIM" = "1" ] && check_one "$DIR/shim/muse" "${HOME:-}/.local/share/wonder-margin/bin/muse"
 
-if muse plugins list --json 2>/dev/null | grep -q '"wonder-margin"'; then
-  say "~ already installed — refreshing"
-  muse plugins update wonder-margin --json >/dev/null || die "plugin update failed"
+plugin_installed() { # structured check, never a substring grep
+  muse plugins list --json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+plugins = data.get("plugins", []) if isinstance(data, dict) else data
+for entry in plugins:
+    plugin = entry.get("plugin", entry) if isinstance(entry, dict) else {}
+    if plugin.get("id") == "wonder-margin" or plugin.get("name") == "wonder-margin":
+        sys.exit(0)
+sys.exit(1)'
+}
+if plugin_installed; then
+  RECORDED_SOURCE="$(muse plugins inspect wonder-margin --json 2>/dev/null \
+    | python3 -c 'import json, sys
+try:
+    print(json.load(sys.stdin).get("record", {}).get("source", {}).get("path", ""))
+except Exception:
+    print("")' 2>/dev/null || true)"
+  if [ -n "$RECORDED_SOURCE" ] && [ "$RECORDED_SOURCE" != "$DIR" ]; then
+    say "~ installed from $RECORDED_SOURCE — reinstalling from $DIR (checkout moved?)"
+    muse plugins remove wonder-margin --json >/dev/null || die "plugin remove failed — try: muse plugins remove wonder-margin"
+    muse plugins install "$DIR" --scope user --json >/dev/null || die "plugin install failed"
+  else
+    say "~ already installed — refreshing"
+    muse plugins update wonder-margin --json >/dev/null || die "plugin update failed"
+  fi
 else
   say "~ installing plugin (user scope)"
   muse plugins install "$DIR" --scope user --json >/dev/null || die "plugin install failed"
@@ -116,6 +143,7 @@ link_one "$DIR/muse-margin" "$BIN_DIR/muse-margin"
 link_one "$DIR/muse-margin" "$BIN_DIR/muse-margintop"
 link_one "$DIR/margin-pane" "$BIN_DIR/margin-pane"
 link_one "$DIR/margin-keep" "$BIN_DIR/margin-keep"
+link_one "$DIR/muse-sideview" "$BIN_DIR/muse-sideview"
 say "✓ linked $BIN_DIR/muse-margin"
 
 if [ "$WITH_SHIM" = "1" ]; then

@@ -132,6 +132,28 @@ class InstallGuardTest(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertFalse(os.path.lexists(link))
 
+    def test_install_reinstalls_when_recorded_source_moved(self):
+        # A stub muse that reports the plugin installed from /old/clone:
+        # install must remove+install from here, not just update.
+        stub = os.path.join(self.bin, "muse")
+        log = os.path.join(self.dir.name, "stub.log")
+        with open(stub, "w", encoding="utf-8") as f:
+            f.write("#!/bin/sh\n"
+                    f"echo \"$@\" >> {log}\n"
+                    "if [ \"$1 $2\" = 'plugins list' ]; then "
+                    "echo '{\"plugins\":[{\"plugin\":{\"id\":\"wonder-margin\"}}]}'; exit 0; fi\n"
+                    "if [ \"$1 $2\" = 'plugins inspect' ]; then "
+                    "echo '{\"record\":{\"source\":{\"path\":\"/old/clone\"}}}'; exit 0; fi\n"
+                    "exit 0\n")
+        os.chmod(stub, 0o755)
+        r = self.run_script(INSTALL)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        with open(log, encoding="utf-8") as f:
+            calls = f.read()
+        self.assertIn("plugins remove wonder-margin", calls)
+        self.assertIn("plugins install", calls)
+        self.assertNotIn("plugins update", calls)
+
     def test_plugin_manifest_matches_changelog(self):
         import json, re
         with open(os.path.join(ROOT, ".muse-plugin", "plugin.json"), encoding="utf-8") as f:

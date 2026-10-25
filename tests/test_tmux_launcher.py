@@ -84,5 +84,50 @@ class TmuxLauncherTest(unittest.TestCase):
             self.assertIn("STUB-MUSE-RUNNING", main)
 
 
+    def test_dedicated_session_reaches_attach_with_margin(self):
+        """Case 2 regression: a detached-created session must survive
+        until attach (destroy-unattached used to kill it instantly,
+        yielding 'margin pane could not open' + 'no sessions')."""
+        tmux("kill-session", "-t", "muse-margin-outer")
+        with tempfile.TemporaryDirectory() as d:
+            stub = os.path.join(d, "muse")
+            with open(stub, "w", encoding="utf-8") as f:
+                f.write("#!/bin/sh\necho STUB-MUSE-RUNNING\nsleep 60\n")
+            os.chmod(stub, 0o755)
+            fake_home = os.path.join(d, "home")
+            log_dir = os.path.join(fake_home, ".local", "share", "muse",
+                                   "sessions", "2026", "01", "01", "deadbeef-5678")
+            os.makedirs(log_dir)
+            with open(os.path.join(log_dir, "session.jsonl"), "w", encoding="utf-8") as f:
+                f.write('{"payload_type": "session.started", "payload": {},'
+                        ' "stream": {"id": "deadbeef-5678"}}\n')
+            # An outer pane gives the launcher a terminal; TMUX is
+            # stripped inside the command so it takes the dedicated path.
+            cmd = (f"env -u TMUX HOME={fake_home} MUSE_BIN={stub} {LAUNCHER}")
+            r = tmux("new-session", "-d", "-s", "muse-margin-outer",
+                     "-x", "160", "-y", "48", "-e", f"HOME={fake_home}", cmd)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            dedicated = ""
+            for _ in range(60):
+                sessions = tmux("list-sessions", "-F", "#{session_name}").stdout.splitlines()
+                found = [s for s in sessions
+                         if s.startswith("muse-margin-") and s != "muse-margin-outer"]
+                if found:
+                    panes = tmux("list-panes", "-t", found[0]).stdout.strip()
+                    if len(panes.splitlines()) == 2:
+                        dedicated = found[0]
+                        break
+                time.sleep(0.25)
+            self.assertTrue(dedicated, f"no dedicated session with 2 panes: {sessions}")
+            seen = ""
+            for _ in range(40):
+                seen = tmux("capture-pane", "-p", "-t", f"{dedicated}:0.1").stdout
+                if "WONDER" in seen:
+                    break
+                time.sleep(0.25)
+            self.assertIn("WONDER", seen)
+            tmux("kill-session", "-t", dedicated)
+
+
 if __name__ == "__main__":
     unittest.main()

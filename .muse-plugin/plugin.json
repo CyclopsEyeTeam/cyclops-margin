@@ -2,8 +2,8 @@
   "schemaVersion": 1,
   "name": "wonder-margin",
   "displayName": "Wonder — Muse in the Margin",
-  "version": "0.3.4",
-  "description": "Wonder, Muse Code's own terminal presence: a living margin that annotates only what it has observed.",
+  "version": "0.4.8",
+  "description": "Wonder, Muse Code's own terminal presence: a living margin that annotates only what it has observed — now hosting Cyclops Sideview, the passive side view that leaves tips for the person to pass along.",
   "compat": {
     "source": "native",
     "manifestDir": ".muse-plugin"
@@ -14,12 +14,22 @@
         "id": "in-the-margin",
         "path": "skills/in-the-margin/SKILL.md",
         "enabledDefault": true
+      },
+      {
+        "id": "in-the-sideview",
+        "path": "skills/in-the-sideview/SKILL.md",
+        "enabledDefault": true
       }
     ],
     "commands": [
       {
         "id": "margin",
         "path": "commands/margin.md",
+        "enabledDefault": true
+      },
+      {
+        "id": "sideview",
+        "path": "commands/sideview.md",
         "enabledDefault": true
       }
     ],

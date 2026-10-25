@@ -36,13 +36,70 @@ sys.stdout.write(out)
   fi
 }
 
+usage() {
+  cat <<'EOF'
+│ margin-keep — keep one line in Wonder's margin, across sessions.
+│
+│   margin-keep "the line worth keeping"   keep it (shown in the pane's box)
+│   margin-keep --stdin                    keep a line fed on stdin
+│   margin-keep                            show what is kept, if anything
+│   margin-keep --clear                    let it go
+│   margin-keep --help                     this text (keeps nothing)
+EOF
+}
+
 case "${1:-}" in
+  --help|-h)
+    if [ $# -gt 1 ]; then
+      printf '│ ! %s takes no further words — nothing was kept.\n' "$1" >&2
+      exit 2
+    fi
+    usage
+    ;;
   --clear|--forget)
+    if [ $# -gt 1 ]; then
+      printf '│ ! %s takes no further words — nothing was let go.\n' "$1" >&2
+      exit 2
+    fi
     if ! rm -f "$KEPT" 2>/dev/null; then
       printf '│ ! could not remove %s — nothing was let go.\n' "$KEPT" >&2
       exit 1
     fi
     printf '│ · kept line let go.\n'
+    ;;
+  --stdin)
+    if [ $# -gt 1 ]; then
+      printf '│ ! %s takes no further words — nothing was kept.\n' "$1" >&2
+      exit 2
+    fi
+    # Keep a line fed on stdin (the /margin command uses this with a
+    # temp file, so the line never enters a shell command string).
+    LINE="$(cat | sanitize)"
+    LINE="${LINE#"${LINE%%[![:space:]]*}"}"
+    LINE="${LINE%"${LINE##*[![:space:]]}"}"
+    if [ -z "$LINE" ]; then
+      printf '│ ! nothing to keep — the line was blank.\n' >&2
+      exit 1
+    fi
+    if [ -e "$KEPT" ] && [ ! -f "$KEPT" ]; then
+      printf '│ ! could not write %s — the line was NOT kept.\n' "$KEPT" >&2
+      exit 1
+    fi
+    KEPT_DIR="$(dirname "$KEPT")"
+    if ! mkdir -p "$KEPT_DIR" 2>/dev/null; then
+      printf '│ ! could not write %s — the line was NOT kept.\n' "$KEPT" >&2
+      exit 1
+    fi
+    TMP="$(mktemp "$KEPT_DIR/.kept.XXXXXX" 2>/dev/null)" || {
+      printf '│ ! could not write %s — the line was NOT kept.\n' "$KEPT" >&2
+      exit 1
+    }
+    if ! printf '%s\n' "$LINE" > "$TMP" 2>/dev/null || ! mv -f "$TMP" "$KEPT" 2>/dev/null; then
+      rm -f "$TMP" 2>/dev/null || true
+      printf '│ ! could not write %s — the line was NOT kept.\n' "$KEPT" >&2
+      exit 1
+    fi
+    printf '│ kept · “%s”\n' "$LINE"
     ;;
   "")
     if [ -f "$KEPT" ] && [ -s "$KEPT" ]; then
@@ -50,6 +107,11 @@ case "${1:-}" in
     else
       printf '│ · nothing kept yet — margin-keep "a line worth keeping"\n'
     fi
+    ;;
+  --*)
+    printf '│ ! unknown flag: %s — nothing was kept.\n' "$1" >&2
+    usage >&2
+    exit 2
     ;;
   *)
     # One kept line is one line: flatten any embedded breaks/tabs to

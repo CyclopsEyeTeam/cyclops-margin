@@ -106,63 +106,179 @@ ACTIVE_STATES = {"attending", "reading", "editing", "working", "responding",
 BLOCKS = " ▁▂▃▄▅▆▇█"
 KEPT_DEFAULT = "~/.local/share/wonder-margin/kept.txt"
 
+def sideview_data_dir():
+    """Sideview's default data dir (single source for both path needs).
+
+    Kept byte-compatible with Sideview's own default_data_dir(); the
+    cross-plugin integration test pins the env names and layout so the
+    two implementations cannot silently drift apart.
+    """
+    override = os.environ.get("CYCLOPS_SIDEVIEW_MUSE_DATA_DIR")
+    if override:
+        return os.path.expanduser(override)
+    xdg = os.environ.get("XDG_STATE_HOME")
+    base = os.path.expanduser(xdg) if xdg else os.path.expanduser("~/.local/state")
+    return os.path.join(base, "cyclops-sideview-muse")
+
+
+def effective_sideview_data_dir():
+    """The data dir Sideview most recently registered a session in.
+
+    A custom --data-dir run leaves a pointer in the default dir; the
+    bridge follows it instead of silently showing nothing.
+    """
+    default = sideview_data_dir()
+    try:
+        with open(os.path.join(default, "active-data-dir.txt"),
+                  encoding="utf-8", errors="ignore") as f:
+            pointed = f.readline().strip()
+        if pointed and os.path.isdir(pointed):
+            return pointed
+    except OSError:
+        pass
+    return default
+
+
 def sideview_tips_default():
-    """Where Cyclops Sideview leaves its tips log (its own default).
+    """Where Cyclops Sideview leaves its tips log.
 
     The pane only ever reads this file; Sideview owns writing it. No
     file, no box — the margin never invents a side comment.
     """
-    override = os.environ.get("CYCLOPS_SIDEVIEW_MUSE_DATA_DIR")
-    if override:
-        return os.path.join(os.path.expanduser(override), "tips.md")
-    xdg = os.environ.get("XDG_STATE_HOME")
-    base = os.path.expanduser(xdg) if xdg else os.path.expanduser("~/.local/state")
-    return os.path.join(base, "cyclops-sideview-muse", "tips.md")
+    return os.path.join(effective_sideview_data_dir(), "tips.md")
+
+
+def project_tips_path(data_dir, cwd):
+    """Per-project tips log: sha256(resolved cwd)[:16] under projects/.
+
+    Byte-compatible with Sideview's own project_tips_path — the
+    contract test pins the scheme so writer and reader cannot drift.
+    """
+    import hashlib
+    key = hashlib.sha256(os.path.realpath(os.path.expanduser(str(cwd))).encode("utf-8")).hexdigest()[:16]
+    return os.path.join(str(data_dir), "projects", key, "tips.md")
+
+
+SIDEVIEW_HEADER_RE = re.compile(r"^## (\S+) · side session (\S+)\s*$")
+SIDEVIEW_TAIL_BYTES = 256 * 1024
+
+
+def _sideview_link(m):
+    label, target = m.group(1), m.group(2)
+    if target.startswith(("http://", "https://")):
+        return label
+    line_no = re.search(r":(\d+)$", target)
+    if line_no and "/" in target:
+        return f"{label}:{line_no.group(1)}"
+    if "/" in target:
+        base = target.rsplit("/", 1)[-1]
+        return f"{label} ({base})" if base and base != label else label
+    return f"{label} ({target})"
+
+
+def _sideview_display_line(line):
+    line = CSI_RE.sub("", line)
+    line = ESC_RE.sub("", line)
+    line = re.sub(r"\[([^\]]+)\]\(([^)]*)\)", _sideview_link, line)
+    return clean(line.replace("`", "")).rstrip()
+
+
+def latest_sideview_entry(text):
+    """The newest Sideview entry: {"created": epoch|None, "text": str}.
+
+    Sections begin only at a strict `## <iso> · side session <id>`
+    header, and body lines written by the launcher are `> `-prefixed —
+    a `## …` line inside the model's own text is body, never a new
+    section. Legacy unprefixed bodies still parse. Markdown links keep
+    their citation (label:line), backticks go, ANSI sequences are
+    stripped whole, and every line passes `clean` — the side's text is
+    data here, never terminal control, and may not borrow the `✓`.
+    """
+    return sideview_entries(text)[-1] if sideview_entries(text) else {
+        "created": None, "text": "", "session": None}
+
+
+def sideview_entries(text):
+    """Every entry in a tips log, oldest first (see latest_sideview_entry)."""
+    sections, current = [], None
+    for line in str(text).splitlines():
+        m = SIDEVIEW_HEADER_RE.match(line)
+        if m:
+            if current is not None:
+                sections.append(current)
+            current = ((m.group(1), m.group(2)), [])
+        elif current is not None:
+            current[1].append(line)
+    if current is not None:
+        sections.append(current)
+    entries = []
+    for (created_raw, session_id), body in sections:
+        created = None
+        try:
+            from datetime import datetime, timezone
+            created = datetime.fromisoformat(
+                created_raw.replace("Z", "+00:00")).timestamp()
+        except Exception:
+            created = None
+        body = list(body)
+        while body and not body[0].strip():
+            body.pop(0)
+        if body and (body[0].startswith("Watched:") or body[0].startswith("> Watched:")):
+            body.pop(0)
+            while body and not body[0].strip():
+                body.pop(0)
+        out = []
+        for line in body:
+            if line.startswith("> "):
+                line = line[2:]
+            elif line == ">":
+                line = ""
+            out.append(_sideview_display_line(line))
+        entries.append({"created": created,
+                        "text": "\n".join(out).strip(),
+                        "session": session_id})
+    return entries
 
 
 def latest_sideview_tip(text):
-    """The newest tip from a Sideview tips log, cleaned for rendering.
+    """The newest tip's text (see latest_sideview_entry)."""
+    return latest_sideview_entry(text)["text"]
 
-    The log is a series of `## …` sections; each new tip appends one.
-    Only the latest is the side's current word. Markdown links collapse
-    to their label, backticks go, and every line passes `clean` — the
-    side's text is data here, never terminal control, and may not
-    borrow the earned `✓`.
-    """
-    sections, current = [], []
-    for line in str(text).splitlines():
-        if line.startswith("## "):
-            if current:
-                sections.append(current)
-            current = [line]
-        elif current:
-            current.append(line)
-    if current:
-        sections.append(current)
-    if not sections:
-        return ""
-    body = sections[-1][1:]
-    while body and not body[0].strip():
-        body.pop(0)
-    if body and body[0].startswith("Watched:"):
-        body.pop(0)
-        while body and not body[0].strip():
-            body.pop(0)
-    out = []
-    for line in body:
-        line = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", line).replace("`", "")
-        out.append(clean(line).rstrip())
-    return "\n".join(out).strip()
+
+def _split_word(word, width):
+    chunks, cur = [], ""
+    for ch, w in zip(word, char_widths(word)):
+        if cur and display_width(cur) + w > width:
+            chunks.append(cur)
+            cur = ""
+        cur += ch
+    if cur:
+        chunks.append(cur)
+    return chunks or [""]
 
 
 def wrap_text(text, width):
-    """Word-wrap plain text to `width` cells (approximate, honest)."""
+    """Word-wrap plain text to `width` cells.
+
+    A word longer than the line (a path/to/file.py:1234 citation) is
+    hard-split across lines rather than clipped mid-token: the whole
+    token survives, so its line number is never silently lost.
+    """
+    width = max(1, width)
     lines = []
     for para in str(text).splitlines():
         words, cur = para.split(), ""
         if not words:
             continue
         for word in words:
+            if display_width(word) > width:
+                if cur:
+                    lines.append(cur)
+                    cur = ""
+                chunks = _split_word(word, width)
+                lines.extend(chunks[:-1])
+                cur = chunks[-1]
+                continue
             trial = f"{cur} {word}".strip()
             if cur and display_width(trial) > width:
                 lines.append(cur)
@@ -216,11 +332,140 @@ def sparkline(stamps, n, now=None):
     peak = max(buckets) or 1
     return "".join(BLOCKS[min(8, round(c * 8 / peak))] for c in buckets)
 
-def newest_session():
-    base = os.path.expanduser("~/.local/share/muse/sessions")
+_KNOWN_IDS_CACHE = {"at": 0.0, "ids": set(), "dirs": None}
+
+
+def known_sideview_session_ids():
+    """Ids Sideview itself registered or receipted (10s TTL cache).
+
+    Sources: the side-sessions registry (default and effective data
+    dirs) and receipt side_session_ids in the effective data dir.
+    The follow loop asks every 2s; the cache keeps that from
+    re-globbing and re-parsing every receipt each time.
+    """
+    now = time.time()
+    dirs = {sideview_data_dir(), effective_sideview_data_dir()}
+    if now - _KNOWN_IDS_CACHE["at"] < 10 and _KNOWN_IDS_CACHE["dirs"] == dirs:
+        return _KNOWN_IDS_CACHE["ids"]
+    ids = set()
+    for base in dirs:
+        try:
+            with open(os.path.join(base, "side-sessions.jsonl"),
+                      encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    try:
+                        sid = json.loads(line).get("id")
+                    except Exception:
+                        continue
+                    if sid:
+                        ids.add(str(sid))
+        except OSError:
+            pass
+        for path in glob.glob(os.path.join(base, "receipts", "*", "receipt.json")):
+            try:
+                with open(path, encoding="utf-8", errors="ignore") as f:
+                    sid = json.load(f).get("side_session_id")
+                if sid:
+                    ids.add(str(sid))
+            except Exception:
+                continue
+    _KNOWN_IDS_CACHE.update({"at": now, "ids": ids, "dirs": dirs})
+    return ids
+
+
+def sideview_installed():
+    """Whether wonder-margin (which now ships Sideview) is installed.
+
+    Tips outlive their plugin if nothing checks: after an uninstall
+    the box must go silent rather than display a ghost forever.
+    Honours XDG_DATA_HOME like the rest of Muse's data layout.
+    """
+    xdg = os.environ.get("XDG_DATA_HOME")
+    base = os.path.expanduser(xdg) if xdg else os.path.expanduser("~/.local/share")
+    path = os.path.join(base, "muse", "plugins", "installed.json")
+    try:
+        with open(path, encoding="utf-8", errors="ignore") as f:
+            record = json.load(f).get("plugins", {}).get("wonder-margin")
+    except Exception:
+        return False
+    return bool(record and record.get("enabled", True))
+
+
+SIDEVIEW_CHARTER_MARK = ("You are Cyclops Sideview — a passive side view "
+                         "of the builder's own work")
+_SIDEVIEW_MARK_CACHE = {}
+
+
+def _all_strings(value, depth=0):
+    if depth > 12:
+        return
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for v in value.values():
+            yield from _all_strings(v, depth + 1)
+    elif isinstance(value, list):
+        for v in value:
+            yield from _all_strings(v, depth + 1)
+
+
+def is_sideview_session(path, known_ids=None):
+    """Whether a session log belongs to a Cyclops Sideview session.
+
+    Registered/receipted ids first. The fallback inspects only the
+    session's own user-intent record for the exact charter opening —
+    a builder that merely *read* Sideview's files (charter text inside
+    tool results) is not a side session, and a side session is caught
+    wherever in the head its prompt record lands.
+    """
+    sid = os.path.basename(os.path.dirname(path))
+    if known_ids is None:
+        known_ids = known_sideview_session_ids()
+    if sid in known_ids:
+        return True
+    try:
+        st = os.stat(path)
+        cache_key = (st.st_mtime, st.st_size)
+    except OSError:
+        return False
+    cached = _SIDEVIEW_MARK_CACHE.get(path)
+    if cached and cached[0] == cache_key:
+        return cached[1]
+    marked = False
+    try:
+        with open(path, encoding="utf-8", errors="ignore") as f:
+            read = 0
+            for line in f:
+                read += len(line)
+                if read > 2 * 1024 * 1024:
+                    break
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                if rec.get("payload_type") == "runtime.user_intent.accepted":
+                    # Only the FIRST user intent decides, and only
+                    # when the charter is its opening — a builder who
+                    # later quotes the charter is still a builder.
+                    marked = any(s.lstrip().startswith(SIDEVIEW_CHARTER_MARK)
+                                 for s in _all_strings(rec.get("payload")))
+                    break
+    except Exception:
+        marked = False
+    if len(_SIDEVIEW_MARK_CACHE) > 512:
+        _SIDEVIEW_MARK_CACHE.clear()
+    _SIDEVIEW_MARK_CACHE[path] = (cache_key, marked)
+    return marked
+
+
+def newest_session(base=None, exclude_sideview=True):
+    base = base or os.path.expanduser("~/.local/share/muse/sessions")
     files = glob.glob(os.path.join(base, "*", "*", "*", "*", "session.jsonl"))
+    known_ids = known_sideview_session_ids() if exclude_sideview else set()
     newest, newest_mtime = None, None
     for path in files:
+        if exclude_sideview and is_sideview_session(path, known_ids):
+            continue
         try:
             mtime = os.path.getmtime(path)
         except OSError:
@@ -230,7 +475,8 @@ def newest_session():
     return newest
 
 class Margin:
-    def __init__(self, kept_path=None, sideview_path=None):
+    def __init__(self, kept_path=None, sideview_path=None,
+                 sideview_known_ids=None, sideview_installed=None):
         self.sigil, self.state, self.colour = "·", "resting", GREY
         self.notes = []          # (sigil, colour, text), newest last
         self.marks = 0           # events observed this session
@@ -262,13 +508,37 @@ class Margin:
         # tally stroke, no annotation, and no ✓.
         self.sideview_path = sideview_path if sideview_path is not None else os.path.expanduser(
             os.environ.get("MARGIN_SIDEVIEW_TIPS") or sideview_tips_default())
-        self._sideview_cache = (None, "")  # (mtime, latest tip)
+        self._sideview_cache = (None, "", None)  # (mtime, latest tip, created epoch)
+        # Display provenance: only entries Sideview registered or
+        # receipted may appear, and only while Sideview is installed.
+        # None means "ask the real checks"; tests may inject both.
+        self._side_known_ids = sideview_known_ids
+        self._side_installed = sideview_installed
+        self._side_path_explicit = (sideview_path is not None
+                                    or bool(os.environ.get("MARGIN_SIDEVIEW_TIPS")))
+        self._installed_cache = (0.0, False)  # (checked_at, result)
         # The last committed answer, held for the copy button. Held, never
         # rendered: the pane shows marks, the clipboard gets the words.
         self.last_answer = ""
         self.button = None       # (row, col0, col1) 0-based, set by render()
         self.copy_feedback = ""  # transient button label after a click
         self.copy_until = 0.0    # feedback shown until this time; never a mark
+        # The Sideview toggle: a pane/session this margin opened, or
+        # None. Opening/closing it is a pane-local act, never a mark.
+        self.sideview_target = None  # tmux pane id ("%…") or session name
+        self.sideview_kind = None    # "pane" | "session"
+        self.side_button = None      # (row, col0, col1) 0-based
+        self.side_feedback = ""      # transient side-button label
+        self.side_until = 0.0
+        # The side-log viewer: a pager pane this margin opened, or None.
+        self.log_target = None
+        self.log_kind = None         # "pane" | "session"
+        self.log_button = None       # (row, col0, col1) 0-based
+        self.log_feedback = ""
+        self.log_until = 0.0
+        self._side_entries_cache = (None, [], 0)  # (mtime, verified entries, size)
+        self._side_count_cache = (None, 0)  # ((mtime, size, known), verified count)
+        self.cwd = ""                # builder cwd from the host's route facts
 
     def kept_text(self):
         try:
@@ -284,19 +554,151 @@ class Margin:
             self._kept_cache = (mtime, text)
         return self._kept_cache[1]
 
-    def sideview_tip(self):
+    def _resolve_sideview_path(self):
+        """Per-project resolution, re-run on every look.
+
+        Explicit path (constructor/env) always wins. Otherwise the
+        builder's cwd (from route facts) selects its project's log —
+        and once the cwd is known, that project's log is the only
+        source: falling back to the legacy global log would show
+        another project's stale word as this project's side view.
+        The global log is read only before the cwd is known (the
+        first moments of a session). The active-data-dir pointer is
+        honoured through effective_sideview_data_dir().
+        """
+        if self._side_path_explicit:
+            return
+        if self.cwd:
+            chosen = project_tips_path(effective_sideview_data_dir(), self.cwd)
+        else:
+            chosen = sideview_tips_default()
+        if chosen != self.sideview_path:
+            self.sideview_path = chosen
+            self._sideview_cache = (None, "", None)
+            self._side_entries_cache = (None, [], 0)
+            self._side_count_cache = (None, 0)
+
+    def sideview_entry(self):
+        """(latest tip text, created epoch|None), tail-read and cached.
+
+        Provenance is enforced here, at the display layer: Sideview
+        must still be installed, and the entry's session id must be
+        one Sideview registered or receipted. A forged or orphaned
+        entry is not displayed and not paraphrased — no box.
+        """
+        if not self._installed_cached():
+            return "", None
+        self._resolve_sideview_path()
         try:
             mtime = os.path.getmtime(self.sideview_path)
         except OSError:
-            return ""
-        if self._sideview_cache[0] != mtime:
+            return "", None
+        # No second cache here: _verified_sideview_entries already
+        # caches on (mtime, known-id set), and a mtime-only cache at
+        # this layer hid freshly-registered tips indefinitely.
+        entries, size = self._verified_sideview_entries(mtime)
+        entry = entries[-1] if entries else {"text": "", "created": None}
+        if entry["text"]:
+            return entry["text"], entry["created"]
+        if size > SIDEVIEW_TAIL_BYTES:
+            # The newest entry's header fell before the tail:
+            # say so, rather than vanish silently.
+            return ("(the latest side entry is larger than the "
+                    "margin reads — full text in the tips log)"), None
+        return "", None
+
+    def _verified_sideview_entries(self, mtime=None):
+        """(verified entries oldest-first, file size), tail-read, cached.
+
+        Same gates as the box: installed + registered/receipted ids.
+        """
+        if mtime is None:
             try:
-                with open(self.sideview_path, encoding="utf-8", errors="ignore") as f:
-                    text = latest_sideview_tip(f.read())
+                mtime = os.path.getmtime(self.sideview_path)
             except OSError:
-                text = ""
-            self._sideview_cache = (mtime, text)
-        return self._sideview_cache[1]
+                return [], 0
+        known = (self._side_known_ids if self._side_known_ids is not None
+                 else known_sideview_session_ids())
+        # The cache key includes the known-id set: an entry appended
+        # just before its registration lands must become visible when
+        # the id arrives, not only when the log's mtime next changes.
+        cache_key = (mtime, frozenset(known))
+        if self._side_entries_cache[0] == cache_key:
+            return self._side_entries_cache[1], self._side_entries_cache[2]
+        entries, size = [], 0
+        try:
+            with open(self.sideview_path, "rb") as f:
+                f.seek(0, 2)
+                size = f.tell()
+                f.seek(max(0, size - SIDEVIEW_TAIL_BYTES))
+                raw = f.read().decode("utf-8", "ignore")
+            entries = [e for e in sideview_entries(raw)
+                       if e["text"] and e.get("session") in known]
+        except OSError:
+            entries, size = [], 0
+        self._side_entries_cache = (cache_key, entries, size)
+        return entries, size
+
+    def _installed_cached(self):
+        if self._side_installed is not None:
+            return self._side_installed
+        checked_at, cached = self._installed_cache
+        if time.time() - checked_at > 10:
+            cached = sideview_installed()
+            self._installed_cache = (time.time(), cached)
+        return cached
+
+    def sideview_count(self):
+        """How many verified side entries exist (for the log button).
+
+        Counts the whole log by streaming it line by line — the
+        256 KiB tail that serves the latest tip would undercount a
+        long log, and the button's number must be the real count.
+        """
+        if not self._installed_cached():
+            return 0
+        self._resolve_sideview_path()
+        try:
+            st = os.stat(self.sideview_path)
+            mtime, size = st.st_mtime, st.st_size
+        except OSError:
+            return 0
+        known = (self._side_known_ids if self._side_known_ids is not None
+                 else known_sideview_session_ids())
+        cache_key = (mtime, size, frozenset(known))
+        if self._side_count_cache[0] == cache_key:
+            return self._side_count_cache[1]
+        count = 0
+        session, has_text, seen_body = None, False, False
+        try:
+            with open(self.sideview_path, encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    m = SIDEVIEW_HEADER_RE.match(line.rstrip("\n"))
+                    if m:
+                        if session in known and has_text:
+                            count += 1
+                        session, has_text, seen_body = m.group(2), False, False
+                        continue
+                    if session is None:
+                        continue
+                    body = line[2:] if line.startswith("> ") else line.rstrip("\n")
+                    if not seen_body:
+                        if not body.strip():
+                            continue
+                        seen_body = True
+                        if body.startswith("Watched:"):
+                            continue
+                    if _sideview_display_line(body).strip():
+                        has_text = True
+            if session in known and has_text:
+                count += 1
+        except OSError:
+            count = 0
+        self._side_count_cache = (cache_key, count)
+        return count
+
+    def sideview_tip(self):
+        return self.sideview_entry()[0]
 
     def _now(self):
         return self._at if self._at is not None else time.time()
@@ -344,6 +746,10 @@ class Margin:
             self.ended = True
             self.set("·", f"ended ({reason})", GREY)
             self.note("·", GREY, f"session ended ({reason}) — marks left as they stand")
+        elif pt == "runtime.session.route_facts":
+            cwd = _as_dict(pl.get("record")).get("cwd")
+            if isinstance(cwd, str) and cwd:
+                self.cwd = cwd
         elif pt == "run.model.configured":
             label = _as_dict(pl.get("record")).get("display_label")
             if label: self.model = clean(label)
@@ -544,6 +950,152 @@ def do_copy(m, deliver=None, emit=None):
     return outcome
 
 
+SIDEVIEW_TOPIC = ("Watch this work from the side. "
+                  "Leave a tip only if something is genuinely relevant.")
+
+
+def sideview_bin():
+    """The muse-sideview launcher, if Sideview is installed."""
+    override = os.environ.get("MARGIN_SIDEVIEW_BIN")
+    if override and os.path.isfile(override) and os.access(override, os.X_OK):
+        return override
+    found = shutil.which("muse-sideview")
+    if found:
+        return found
+    fallback = os.path.expanduser("~/.local/bin/muse-sideview")
+    return fallback if os.path.isfile(fallback) and os.access(fallback, os.X_OK) else None
+
+
+def _tmux(runner, *argv):
+    return runner(["tmux", *argv], capture_output=True, text=True, timeout=10)
+
+
+def sideview_alive(m, runner=subprocess.run):
+    if not m.sideview_target:
+        return False
+    try:
+        if m.sideview_kind == "pane":
+            proc = _tmux(runner, "display-message", "-p", "-t",
+                         m.sideview_target, "#{pane_id}")
+        else:
+            proc = _tmux(runner, "has-session", "-t", m.sideview_target)
+        return proc.returncode == 0
+    except Exception:
+        return False
+
+
+def toggle_sideview(m, runner=subprocess.run):
+    """The side-view button, pressed: open the visitor, or close it.
+
+    Opening launches `muse-sideview` in its own tmux pane (split when
+    inside tmux, a detached session otherwise) watching the builder's
+    cwd. Closing kills only the pane/session this margin opened.
+    Returns "on" | "off" | "missing" | "failed". Never a host mark.
+    """
+    import shlex
+    if m.sideview_target:
+        if sideview_alive(m, runner):
+            try:
+                if m.sideview_kind == "pane":
+                    _tmux(runner, "kill-pane", "-t", m.sideview_target)
+                else:
+                    _tmux(runner, "kill-session", "-t", m.sideview_target)
+            except Exception:
+                pass
+            m.sideview_target = m.sideview_kind = None
+            m.side_feedback, m.side_until = "◐ side view: off", time.time() + 2.5
+            return "off"
+        m.sideview_target = m.sideview_kind = None  # it closed itself; reopen below
+    binary = sideview_bin()
+    if not binary:
+        m.side_feedback = "◐ muse-sideview not found"
+        m.side_until = time.time() + 3.5
+        return "missing"
+    cwd = m.cwd or os.getcwd()
+    # The button opens the separate Sideview conversation in its own
+    # pane (the passive watcher stays available as muse-sideview
+    # --watch from a terminal; it is not what this button does).
+    inner = f"{shlex.quote(binary)} {shlex.quote(SIDEVIEW_TOPIC)}"
+    try:
+        if os.environ.get("TMUX"):
+            proc = _tmux(runner, "split-window", "-h", "-P", "-F",
+                         "#{pane_id}", "-c", cwd, inner)
+            if proc.returncode != 0 or not proc.stdout.strip():
+                raise RuntimeError("split failed")
+            m.sideview_target, m.sideview_kind = proc.stdout.strip(), "pane"
+        else:
+            name = f"margin-sideview-{os.getpid()}"
+            proc = _tmux(runner, "new-session", "-d", "-s", name, "-c", cwd, inner)
+            if proc.returncode != 0:
+                raise RuntimeError("session failed")
+            m.sideview_target, m.sideview_kind = name, "session"
+    except Exception:
+        m.side_feedback = "◐ side view: could not open"
+        m.side_until = time.time() + 3.5
+        return "failed"
+    m.side_feedback, m.side_until = "◐ side view: on", time.time() + 2.5
+    return "on"
+
+
+def toggle_side_log(m, runner=subprocess.run):
+    """The side-log button: open the whole tips log in a pager pane.
+
+    The box only ever shows the latest tip; this is how the earlier
+    ones are read. Opens `less`/`more` on the tips file in its own
+    tmux pane (detached session outside tmux); pressing again closes
+    only that pane. Returns "open" | "closed" | "empty" | "failed".
+    """
+    import shlex
+    if m.log_target:
+        alive = False
+        try:
+            if m.log_kind == "pane":
+                alive = _tmux(runner, "display-message", "-p", "-t",
+                              m.log_target, "#{pane_id}").returncode == 0
+            else:
+                alive = _tmux(runner, "has-session", "-t",
+                              m.log_target).returncode == 0
+        except Exception:
+            alive = False
+        if alive:
+            try:
+                if m.log_kind == "pane":
+                    _tmux(runner, "kill-pane", "-t", m.log_target)
+                else:
+                    _tmux(runner, "kill-session", "-t", m.log_target)
+            except Exception:
+                pass
+            m.log_target = m.log_kind = None
+            m.log_feedback, m.log_until = "≡ side log: closed", time.time() + 2.5
+            return "closed"
+        m.log_target = m.log_kind = None
+    if not m.sideview_count():
+        m.log_feedback, m.log_until = "≡ side log · none yet", time.time() + 3.0
+        return "empty"
+    pager = shutil.which("less") or shutil.which("more") or "cat"
+    inner = f"{shlex.quote(pager)} {shlex.quote(m.sideview_path)}"
+    cwd = m.cwd or os.getcwd()
+    try:
+        if os.environ.get("TMUX"):
+            proc = _tmux(runner, "split-window", "-h", "-P", "-F",
+                         "#{pane_id}", "-c", cwd, inner)
+            if proc.returncode != 0 or not proc.stdout.strip():
+                raise RuntimeError("split failed")
+            m.log_target, m.log_kind = proc.stdout.strip(), "pane"
+        else:
+            name = f"margin-sidelog-{os.getpid()}"
+            proc = _tmux(runner, "new-session", "-d", "-s", name, "-c", cwd, inner)
+            if proc.returncode != 0:
+                raise RuntimeError("session failed")
+            m.log_target, m.log_kind = name, "session"
+    except Exception:
+        m.log_feedback = "≡ side log: could not open"
+        m.log_until = time.time() + 3.5
+        return "failed"
+    m.log_feedback, m.log_until = "≡ side log: open", time.time() + 2.5
+    return "open"
+
+
 def parse_input(data):
     """Terminal input -> intent. SGR mouse presses (not releases, not
     motion); a lone `c`/`y` copies, lone Ctrl-C / `q` leaves. 1-based cells.
@@ -555,7 +1107,13 @@ def parse_input(data):
     """
     events = []
     for b, x, y, final in MOUSE_RE.findall(data):
-        if final == "M" and not (int(b) & 32) and int(b) & 3 != 3:
+        code = int(b)
+        # Wheel events (64/65) are scrolls, never presses: scrolling
+        # over a button must not copy, open the log, or launch a
+        # side session nobody asked for.
+        if code & 64:
+            continue
+        if final == "M" and not (code & 32) and code & 3 != 3:
             events.append(("click", int(x), int(y)))
     rest = MOUSE_RE.sub("", data)
     rest = PASTE_RE.sub("", rest)
@@ -564,6 +1122,10 @@ def parse_input(data):
     if len(rest) == 1:
         if rest in "cCyY":
             events.append(("copy",))
+        elif rest in "vV":
+            events.append(("sideview",))
+        elif rest in "lL":
+            events.append(("sidelog",))
         elif rest in ("\x03", "q", "Q"):
             events.append(("quit",))
     return events
@@ -574,6 +1136,20 @@ def hit_button(m, x, y):
     if not m.button:
         return False
     row, col0, col1 = m.button
+    return y - 1 == row and col0 <= x - 1 <= col1
+
+
+def hit_side_button(m, x, y):
+    if not m.side_button:
+        return False
+    row, col0, col1 = m.side_button
+    return y - 1 == row and col0 <= x - 1 <= col1
+
+
+def hit_log_button(m, x, y):
+    if not m.log_button:
+        return False
+    row, col0, col1 = m.log_button
     return y - 1 == row and col0 <= x - 1 <= col1
 
 
@@ -673,6 +1249,38 @@ def render(m, width, height):
     drawn = clip(lines[-1], width)
     m.button = (len(lines) - 1, 1,
                 max(1, min(display_width(btn), display_width(drawn) - 1)))
+    # The second button: the Sideview toggle. Ink while the visitor is
+    # open, dim while not, reversed during its brief feedback. Click
+    # it (or press v) to open/close the live side pane.
+    if time.time() < m.side_until and m.side_feedback:
+        side_label, side_colour = m.side_feedback, REV + INK
+    elif m.sideview_target:
+        side_label, side_colour = "◐ Side Review: open", INK
+    else:
+        side_label, side_colour = "◐ Open Side Review Conversation", DIM
+    side_btn = f"[ {side_label} ]"
+    side_hint = f" {DIM}(click or v){RESET}" if 1 + len(side_btn) + 13 <= width else ""
+    lines.append(f" {side_colour}{side_btn}{RESET}{side_hint}")
+    side_drawn = clip(lines[-1], width)
+    m.side_button = (len(lines) - 1, 1,
+                     max(1, min(display_width(side_btn), display_width(side_drawn) - 1)))
+    # The third button: read the whole side log, not just the latest.
+    # Its label carries the verified entry count, so an hour's worth
+    # of tips never silently collapses to the newest one.
+    if time.time() < m.log_until and m.log_feedback:
+        log_label, log_colour = m.log_feedback, REV + INK
+    elif m.log_target:
+        log_label, log_colour = "≡ side log: open", INK
+    else:
+        count = m.sideview_count()
+        log_label = f"≡ side log · {count}" if count else "≡ side log · none yet"
+        log_colour = INK if count else DIM
+    log_btn = f"[ {log_label} ]"
+    log_hint = f" {DIM}(click or l){RESET}" if 1 + len(log_btn) + 13 <= width else ""
+    lines.append(f" {log_colour}{log_btn}{RESET}{log_hint}")
+    log_drawn = clip(lines[-1], width)
+    m.log_button = (len(lines) - 1, 1,
+                    max(1, min(display_width(log_btn), display_width(log_drawn) - 1)))
     # A line kept is kept on purpose, in a file, across sessions
     # (margin-keep). No file, no box — the newest note is not dressed up
     # as something cherished.
@@ -697,20 +1305,53 @@ def render(m, width, height):
     # and (cleaned on the way in) may not borrow the earned ✓. No tips
     # log, no box. It sits last so a short frame sacrifices the visitor
     # before it sacrifices the record.
-    side = m.sideview_tip()
-    if side and compact:
-        first = side.splitlines()[0] if side.splitlines() else ""
-        lines.append(f" {GREY}◐ side ·{RESET} “{first}”")
-    elif side:
-        box_w = max(20, width - 6)
-        lines.append("")
-        lines.append(clip(f" {GREY}╭─ from the side · Cyclops Sideview {'─' * max(0, box_w - 34)}╮{RESET}", width))
-        for wrapped in wrap_text(side, box_w)[:6]:
-            lines.append(f" {GREY}│{RESET} {wrapped}")
-        lines.append(clip(f" {GREY}╰{'─' * box_w}╯{RESET}", width))
+    side, side_created = m.sideview_entry()
+    side_start = None
+    if side:
+        if side_created is None:
+            age_label, side_stale = "undated", False
+        else:
+            age_s = max(0, int(now - side_created))
+            side_stale = age_s > 300
+            if age_s < 60:
+                age_label = "just now"
+            elif age_s < 3600:
+                age_label = f"{age_s // 60}m old"
+            elif age_s < 86400:
+                age_label = f"{age_s // 3600}h old"
+            else:
+                age_label = f"{age_s // 86400}d old"
+        side_colour = DIM if side_stale else GREY
+        if compact:
+            side_start = len(lines)
+            first = side.splitlines()[0] if side.splitlines() else ""
+            more = " …" if ("\n" in side or len(first) < len(side)) else ""
+            lines.append(f" {side_colour}◐ side · {age_label} ·{RESET} “{first}”{more}")
+        else:
+            box_w = max(20, width - 6)
+            side_start = len(lines)
+            lines.append("")
+            title = f"from the side · Sideview · {age_label}"
+            lines.append(clip(f" {side_colour}╭─ {title} {'─' * max(0, box_w - len(title) - 3)}╮{RESET}", width))
+            wrapped = wrap_text(side, box_w)
+            shown = wrapped[:6]
+            if len(wrapped) > 6:
+                shown = wrapped[:5] + [f"… +{len(wrapped) - 5} more lines (full tip in tips log)"]
+            for wrapped_line in shown:
+                lines.append(f" {side_colour}│{RESET} {wrapped_line}")
+            lines.append(clip(f" {side_colour}╰{'─' * box_w}╯{RESET}", width))
     if not compact:
         lines.append("")
     lines.append(f" {DIM}talk in Muse pane → · Ctrl-C ends me{RESET}")
+    # A box that does not fit whole is dropped whole, never amputated:
+    # a half-drawn box would present a partial tip as the complete tip.
+    if side_start is not None and len(lines) > height:
+        if compact:
+            del lines[side_start:side_start + 1]
+        elif side_start < height:
+            # Box spans from its leading blank to the closing border,
+            # which sits just before the trailing blank+footer pair.
+            del lines[side_start:len(lines) - 2]
     return "\n".join(clip(line, width) for line in lines[:height])
 
 def term_size():
@@ -805,6 +1446,17 @@ def wait_for_session(pinned_path=None):
 
 
 def follow(path, once=False, pinned=False):
+    # SIGTERM/SIGHUP must restore the terminal like Ctrl-C does:
+    # Python's default kill would skip the finally and leave a
+    # standalone terminal in cbreak with mouse reporting on.
+    import signal as _signal
+    def _leave(signum, frame):
+        raise KeyboardInterrupt
+    for _sig in (_signal.SIGTERM, _signal.SIGHUP):
+        try:
+            _signal.signal(_sig, _leave)
+        except Exception:
+            pass
     m = Margin()
     # Populate from the tail so a pane opened mid-session is not empty.
     # The follow offset is what the tail read consumed — never a later
@@ -839,7 +1491,7 @@ def follow(path, once=False, pinned=False):
             # (the pane is usually launched at the same moment as `muse`) —
             # but never steal a live session: a second concurrent `muse`
             # must not flip the pane back and forth, dropping its tally.
-            if not pinned and time.time() - last_check > 2:
+            if not pinned and time.time() - last_check > 10:
                 last_check = time.time()
                 newer = newest_session()
                 if newer and newer != path:
@@ -850,7 +1502,15 @@ def follow(path, once=False, pinned=False):
                         ages = (0.0, 0.0)
                     if should_adopt(m.ended, ages[0], ages[1]):
                         path = newer
+                        keep_target, keep_kind, keep_cwd = (
+                            m.sideview_target, m.sideview_kind, m.cwd)
+                        keep_log, keep_log_kind = m.log_target, m.log_kind
                         m = Margin()
+                        # The visitor survives adoption: it watches the
+                        # work, not one session log.
+                        m.sideview_target, m.sideview_kind, m.cwd = (
+                            keep_target, keep_kind, keep_cwd)
+                        m.log_target, m.log_kind = keep_log, keep_log_kind
                         offset = load_tail(m, path)
                         carry = ""
             try:
@@ -894,6 +1554,14 @@ def follow(path, once=False, pinned=False):
                                 event[0] == "click" and hit_button(m, event[1], event[2])):
                             do_copy(m)
                             last_draw = ""  # show the pressed button at once
+                        if event[0] == "sideview" or (
+                                event[0] == "click" and hit_side_button(m, event[1], event[2])):
+                            toggle_sideview(m)
+                            last_draw = ""  # show the toggle at once
+                        if event[0] == "sidelog" or (
+                                event[0] == "click" and hit_log_button(m, event[1], event[2])):
+                            toggle_side_log(m)
+                            last_draw = ""
             else:
                 time.sleep(0.25)
     except KeyboardInterrupt:

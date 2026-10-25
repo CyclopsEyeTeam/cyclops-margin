@@ -24,6 +24,33 @@ class MarginKeepTest(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         return r.stdout
 
+    def test_stdin_keeps_without_shell_quoting(self):
+        line = 'a "quoted" `tick` $(not-run) line'
+        r = subprocess.run([KEEP, "--stdin"], input=line + "\n",
+                           capture_output=True, text=True, env=self.env, timeout=20)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        with open(self.path, encoding="utf-8") as f:
+            self.assertEqual(f.read(), line + "\n")
+
+    def test_help_and_unknown_flags_keep_nothing(self):
+        r = subprocess.run([KEEP, "--help"], capture_output=True, text=True,
+                           env=self.env, timeout=20)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("margin-keep", r.stdout)
+        self.assertFalse(os.path.exists(self.path))
+        for argv in (["--hlep"], ["--stdin", "extra"], ["--help", "extra"]):
+            r = subprocess.run([KEEP, *argv], capture_output=True, text=True,
+                               env=self.env, timeout=20)
+            self.assertEqual(r.returncode, 2, argv)
+            self.assertFalse(os.path.exists(self.path), argv)
+
+    def test_clear_with_extra_words_refuses(self):
+        self.run_keep("keep me")
+        r = subprocess.run([KEEP, "--clear", "anything"], capture_output=True,
+                           text=True, env=self.env, timeout=20)
+        self.assertEqual(r.returncode, 2)
+        self.assertTrue(os.path.exists(self.path))
+
     def test_round_trip(self):
         self.assertIn("nothing kept", self.run_keep())
         self.assertIn("narrow on purpose",

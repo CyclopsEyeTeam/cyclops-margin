@@ -105,19 +105,63 @@ It is one plain line at `~/.local/share/wonder-margin/kept.txt`
 the newest note is never dressed up as something cherished. `/margin keep …`
 does the same from inside the Muse pane.
 
-The margin also hosts a visitor: **Cyclops Sideview**
-(`cyclops-sideview-muse`, the passive side view that leaves tips for you
-to pass to the builder). When its tips log exists
-(`~/.local/state/cyclops-sideview-muse/tips.md`; `MARGIN_SIDEVIEW_TIPS`
-overrides, and `CYCLOPS_SIDEVIEW_MUSE_DATA_DIR` is honoured), the pane
-shows the latest tip in a `from the side · Cyclops Sideview` box below
-the annotations. The side's words are a guest's comment, not a mark:
-they earn no tally stroke, join no annotation, are cleaned like any
-untrusted text (no escapes, no borrowed `✓`), and the box sits last so
-a short frame sacrifices the visitor before the record. No tips log,
-no box. The pane only reads the file; Sideview owns writing it.
+To catch up on tips you missed, the third button,
+**`[ ≡ side log · N ]`** (click, or `l`), opens the whole tips log
+in a pager pane — the margin box only ever shows the latest tip, so
+the count on the button is how you know there are earlier ones.
+Press it again to close the pager. No tips yet, it says so.
 
-The pane has one button: **`[ ⧉ copy my last message ]`** — click it (or
+Turn the visitor on from the pane itself: the second button,
+**`[ ◐ Open Side Review Conversation ]`** (click it, or press `v`
+with the pane focused), opens the separate Sideview conversation
+in its own tmux pane beside the builder — a real second
+conversation you can talk to, labelled for exactly what it is.
+Pressing it again closes only that pane. Outside tmux it opens a
+detached `margin-sideview-*` session instead. If `muse-sideview`
+is not installed, the button says so. Note a live conversation
+pane keeps web tools, because interactive `muse` offers no
+`--disable-web-tools` switch (headless runs deny them).
+
+The passive arrangement is still there when you want tips to pop
+up uninvited: `muse-sideview --watch` from a terminal tails the
+builder's session log and, after a finished turn with edits or a
+failed tool — and a quiet debounce — runs a headless look on its
+own. Looks are spaced (≥180s apart, ≤6/hour by default;
+`--watch-min-interval/--watch-cap/--watch-debounce` tune it, and
+each look still costs tokens). `/sideview "…"` in the Muse pane
+or `muse-sideview --once "…"` in a terminal work too.
+
+The margin also hosts a visitor: **Cyclops Sideview** — the passive
+side view that leaves tips for you to pass to the builder. Since
+0.4.0 it ships *inside this plugin* (the `in-the-sideview` skill,
+the `/sideview` command, and the `muse-sideview` launcher, linked
+by this installer); the old separate `cyclops-sideview-muse` plugin
+is retired — run its `uninstall.sh` once, then this `install.sh`.
+When its tips log exists
+(`~/.local/state/cyclops-sideview-muse/projects/<cwd-hash>/tips.md` —
+per project, keyed by the builder's working directory, so tips from
+another terminal never leak in; a pre-per-project global `tips.md`
+shows only before the builder's directory is known — once it is, that
+project's log is the only source, so no stale global word poses as
+this project's side view; `MARGIN_SIDEVIEW_TIPS`
+overrides, and `CYCLOPS_SIDEVIEW_MUSE_DATA_DIR` is honoured), the pane
+shows the latest tip in a `from the side · Sideview · <age>` box below the
+annotations. Only entries Sideview registered or receipted are shown,
+and only while Sideview is installed — accidental, orphaned, or
+post-uninstall entries get no box. (This stops accidents and ghosts,
+not deliberate same-user forgery: the ids are printed in the log
+itself, so they are provenance, not secrets.) The box carries the tip's age and dims after five quiet
+minutes; truncation is announced, long citations wrap whole, and a box
+that does not fit is dropped whole rather than amputated. The side's
+words are a guest's comment, not a mark: they earn no tally stroke,
+join no annotation, are cleaned like any untrusted text (no escapes,
+no borrowed `✓`), and sit last so a short frame sacrifices the visitor
+before the record. No tips log, no box. The pane only reads the file;
+Sideview owns writing it. The pane also never adopts a Sideview
+session as the session it annotates (excluded by receipt id and by
+the side charter in the log head): the visitor cannot become the page.
+
+The pane's first button is **`[ ⧉ copy my last message ]`** — click it (or
 press `c` with the pane focused; `q` also leaves) and Wonder's last
 committed answer goes to your clipboard. The text is held in memory for
 copying and is never displayed in the pane. The button says `copied` only
@@ -148,6 +192,13 @@ intercepts only the exact `--margin` token.
 - `skills/in-the-margin/SKILL.md` — Wonder itself: form, sigils, voice,
   truthfulness contract. This is what the agent loads.
 - `commands/margin.md` — the `/margin` command.
+- `skills/in-the-sideview/SKILL.md` + `commands/sideview.md` — Cyclops
+  Sideview itself: the passive side view's charter and its command.
+- `muse-sideview` — the Sideview launcher: opens the side session
+  (`--tmux`, `--once`, second terminal), keeps receipts, the session
+  registry, and the tips log under
+  `~/.local/state/cyclops-sideview-muse` (the data dir keeps its
+  original name; history is not renamed by the merge).
 - `sidecar/margin.py` — the visible body. It follows the newest Muse session
   log (`~/.local/share/muse/sessions/…/session.jsonl`) and moves only on real
   host events, timed by the log's own `recorded_at` stamps. It never shows

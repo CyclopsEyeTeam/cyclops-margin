@@ -1,0 +1,1130 @@
+#!/usr/bin/env python3
+"""muse-sideview — Cyclops Sideview for Muse.
+
+Opens a *separate* Muse session beside the builder — in a tmux side
+pane, a second terminal, or one headless run — that watches the work
+from the side and leaves short, relevant tips. It never edits, never
+drives, and never sends anything to the builder's session: its comments
+appear only in its own pane/terminal and, for `--once`, in the tips log
+(`projects/<cwd-hash>/tips.md` in the data dir — per project) for the
+person to read and pass along.
+
+Honest scope: the side session is a new session with no conversation
+history copied. Project rules, skills and instructions load as Muse
+normally loads them; complete isolation is NOT claimed. Headless runs
+are read-only by default (--disable-write --disable-shell); read-only
+is a write barrier, not an isolation barrier.
+
+Stdlib only. Python 3.10+.
+"""
+import argparse
+from datetime import datetime, timezone
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import uuid
+
+VERSION = "0.1.3"
+SIDEVIEW_ENV_MARKER = "CYCLOPS_SIDEVIEW_SESSION"
+MARK = "◐ Sideview · Side View"
+MAX_EVIDENCE_BYTES = 64 * 1024
+MAX_EVIDENCE_FILES = 16
+MAX_EVIDENCE_TOTAL_BYTES = 512 * 1024
+MAX_PROMPT_BYTES = 512 * 1024
+SENSITIVE_SUFFIXES = {".pem", ".key", ".p12", ".pfx", ".kdbx", ".keystore", ".jks"}
+SENSITIVE_EXACT = {".netrc", ".npmrc", ".pypirc", ".git-credentials", "htpasswd"}
+SENSITIVE_DIR_PARTS = {".ssh", ".gnupg", ".aws", ".docker"}
+SECRET_CONTENT_PATTERNS = [
+    re.compile(r"-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----"),
+    re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b"),
+    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"),
+    re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}\b"),
+    re.compile(r"(?im)\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|"
+               r"auth[_-]?token|token|client[_-]?secret|secret|password|"
+               r"passwd|private[_-]?key)\b\s*[\"']?\s*[:=]\s*[\"']?[^\s\"',}]{4,}"),
+    # Long-form names (aws_secret_access_key, …) hide the keyword inside
+    # a longer identifier, where \b after the keyword never matches.
+    re.compile(r"(?im)\b\w*(?:secret|passwd|password|api[_-]?key|"
+               r"access[_-]?key|auth[_-]?token)\w*\s*[\"']?\s*[:=]\s*"
+               r"[\"']?[^\s\"',}]{8,}"),
+    re.compile(r"\bxox[baprs]-[A-Za-z0-9\-]{10,}\b"),
+    re.compile(r"\bsk-(?:ant-)?[A-Za-z0-9_\-]{16,}\b"),
+    re.compile(r"\b[rs]k_(?:live|test)_[A-Za-z0-9]{10,}\b"),
+    re.compile(r"\bAIza[A-Za-z0-9_\-]{20,}\b"),
+    re.compile(r"(?im)\b(?:password|passwd|secret|token|api[_-]?key)\b"
+               r"\s+(?:is|:)\s*\S{8,}"),
+    re.compile(r"\b[A-Z][A-Z0-9_]*?(?:SECRET|TOKEN|PASSWORD|PASSWD|API_KEY)"
+               r"[A-Z0-9_]*\s*=\s*\S+"),
+    re.compile(r"[a-z][a-z0-9+.\-]*://[^\s/:@]+:[^\s/@]{1,}@"),
+    re.compile(r"(?i)\bauthorization\s*:\s*bearer\s+\S{8,}"),
+]
+
+CHARTER = """\
+You are Cyclops Sideview — a passive side view of the builder's own \
+work. The builder (another Muse session) is doing the work; you watch \
+from the side and leave short, relevant tips for the person to pass \
+along. You never edit files, never run the builder's task, never commit, \
+never re-plan the work, and you never address instructions to the builder: \
+tips are phrased for the person. If nothing relevant is visible, say \
+exactly "◐ nothing from the side right now" and stop. Otherwise give at \
+most a handful of tips, each starting "◐ Sideview ·", naming where \
+(path/to/file:line) and why it might matter. Name what you did not check."""
+
+
+class UserError(Exception):
+    pass
+
+
+def utcnow():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def default_data_dir():
+    override = os.environ.get("CYCLOPS_SIDEVIEW_MUSE_DATA_DIR")
+    if override:
+        return Path(override).expanduser()
+    xdg = os.environ.get("XDG_STATE_HOME")
+    base = Path(xdg).expanduser() if xdg else Path.home() / ".local" / "state"
+    return base / "cyclops-sideview-muse"
+
+
+def save(path, text):
+    parent_existed = path.parent.exists()
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if not parent_existed:
+        try:
+            os.chmod(path.parent, 0o700)
+        except OSError:
+            pass
+    tmp = path.with_name(f"{path.name}.tmp-{os.getpid()}-{uuid.uuid4().hex[:8]}")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+_BARE_SECRET_CANDIDATE = re.compile(r"\b[A-Za-z0-9/+=]{40}\b")
+
+
+def looks_like_secret_content(text):
+    if any(p.search(text) for p in SECRET_CONTENT_PATTERNS):
+        return True
+    for match in _BARE_SECRET_CANDIDATE.finditer(text):
+        token = match.group(0)
+        if all(ch in "0123456789abcdef" for ch in token):
+            continue
+        if any(ch in "/+" for ch in token) or (
+                any(ch.isupper() for ch in token)
+                and any(ch.islower() for ch in token)
+                and any(ch.isdigit() for ch in token)):
+            return True
+    return False
+
+
+def is_sensitive_name(path):
+    parts = {p.lower() for p in path.parts}
+    if parts & SENSITIVE_DIR_PARTS:
+        return True
+    if path.name.lower() in SENSITIVE_EXACT:
+        return True
+    if path.suffix.lower() in SENSITIVE_SUFFIXES:
+        return True
+    name = path.name.lower()
+    return name == ".env" or name.startswith(".env.")
+
+
+def validate_evidence(files, cwd, allow_outside):
+    if len(files) > MAX_EVIDENCE_FILES:
+        raise UserError(f"too many evidence files (max {MAX_EVIDENCE_FILES})")
+    seen = set()
+    out = []
+    total = 0
+    for raw in files:
+        p = Path(raw).expanduser()
+        if not p.is_absolute():
+            p = cwd / p
+        try:
+            real = p.resolve(strict=True)
+        except OSError:
+            raise UserError(f"evidence file not found: {raw}") from None
+        if not real.is_file():
+            raise UserError(f"evidence is not a file: {raw}")
+        if real in seen:
+            continue
+        seen.add(real)
+        if not allow_outside:
+            try:
+                real.relative_to(cwd.resolve())
+            except ValueError:
+                raise UserError(
+                    f"evidence is outside --cwd (pass --allow-outside-evidence to allow): {raw}"
+                ) from None
+        if is_sensitive_name(real):
+            raise UserError(f"evidence name looks credential-bearing, refused: {raw}")
+        # Stat before reading: the size limit must bound memory, not
+        # merely reject after the whole file is already in RAM.
+        if real.stat().st_size > MAX_EVIDENCE_BYTES:
+            raise UserError(f"evidence file too large (max {MAX_EVIDENCE_BYTES} bytes): {raw}")
+        data = real.read_bytes()
+        if len(data) > MAX_EVIDENCE_BYTES:
+            raise UserError(f"evidence file too large (max {MAX_EVIDENCE_BYTES} bytes): {raw}")
+        total += len(data)
+        if total > MAX_EVIDENCE_TOTAL_BYTES:
+            raise UserError(f"evidence too large in total (max {MAX_EVIDENCE_TOTAL_BYTES} bytes)")
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            raise UserError(f"evidence is not UTF-8 text: {raw}") from None
+        if looks_like_secret_content(text):
+            raise UserError(f"evidence content looks secret-bearing, refused: {raw}")
+        out.append({"path": str(real), "sha256": hashlib.sha256(data).hexdigest(),
+                    "bytes": len(data)})
+    return out
+
+
+def build_prompt(topic, evidence):
+    lines = [CHARTER, ""]
+    lines.append(f"Watch this: {topic}" if topic else "Watch the work in this directory.")
+    if evidence:
+        lines.append("")
+        lines.append("Named evidence (read these files yourself):")
+        for item in evidence:
+            lines.append(f"- {item['path']}")
+    lines.append("")
+    lines.append(
+        "Remember: tips only, phrased for the person. Nothing you say is "
+        "sent to the builder automatically."
+    )
+    prompt = "\n".join(lines)
+    if len(prompt.encode("utf-8")) > MAX_PROMPT_BYTES:
+        raise UserError(f"prompt too large (max {MAX_PROMPT_BYTES} bytes)")
+    return prompt
+
+
+def child_env():
+    env = dict(os.environ)
+    for key in ("MUSE_SESSION_ID", "MUSE_THREAD_ID", "MUSE_TOOL_USE_ID",
+                "CLAUDE_CODE_TOOL_USE_ID", "CLAUDE_CODE_SESSION_ID"):
+        env.pop(key, None)
+    env[SIDEVIEW_ENV_MARKER] = "1"
+    return env
+
+
+def headless_command(args, session_id, prompt_path):
+    cmd = [args.muse_bin, "exec", "--json", "--session-id", session_id]
+    if args.model:
+        cmd += ["--model", args.model]
+    # Each restriction lifts only by its own flag: --allow-write alone
+    # must not silently re-enable shell or web tools.
+    if not args.allow_write:
+        cmd += ["--disable-write"]
+    if not args.allow_shell:
+        cmd += ["--disable-shell"]
+    if not args.allow_web:
+        cmd += ["--disable-web-tools"]
+    cmd += ["--prompt-file", str(prompt_path)]
+    return cmd
+
+
+def interactive_command(args, prompt=None):
+    cmd = [args.muse_bin]
+    if args.model:
+        cmd += ["--model", args.model]
+    if not args.allow_write:
+        cmd += ["--disable-write"]
+    if not args.allow_shell:
+        cmd += ["--disable-shell"]
+    if prompt is not None:
+        cmd += ["--", prompt]
+    return cmd
+
+
+def deliver_tmux_prompt(target, prompt):
+    """Paste the prompt into a tmux pane without putting it in argv.
+
+    The pane's start command stays `muse …` (flags only): the prompt
+    travels through a tmux buffer fed on stdin, so it never appears
+    in `ps` or in tmux's retained pane start-command. The buffer is
+    deleted immediately after pasting.
+    """
+    buf = f"sideview-{os.getpid()}"
+    env = child_env()
+    try:
+        subprocess.run(["tmux", "load-buffer", "-b", buf, "-"],
+                       input=prompt, text=True, check=True, env=env,
+                       capture_output=True)
+        paste = ["tmux", "paste-buffer", "-b", buf]
+        keys = ["tmux", "send-keys", "Enter"]
+        if target:
+            paste += ["-t", target]
+            keys = ["tmux", "send-keys", "-t", target, "Enter"]
+        subprocess.run(paste, check=True, env=env, capture_output=True)
+        subprocess.run(keys, check=True, env=env, capture_output=True)
+    finally:
+        subprocess.run(["tmux", "delete-buffer", "-b", buf],
+                       env=env, capture_output=True)
+
+
+MAX_EVENTS_BYTES = 16 * 1024 * 1024
+
+
+def extract_result(events_path):
+    """The side session's text (see _extract_result for the cap flag)."""
+    return _extract_result(events_path)[0]
+
+
+def _extract_result(events_path):
+    """Concatenate run.output.delta text from a `muse exec --json` stream.
+
+    Falls back to any other output-shaped event so a changed event name
+    yields the text instead of a silent empty success. Returns
+    (text, truncated): truncated is True when the event cap stopped
+    the read, so callers never present a capped stream as complete."""
+    deltas, fallback = [], []
+    truncated = False
+    try:
+        stream = open(events_path, encoding="utf-8", errors="replace")
+    except OSError:
+        return "", False
+    read_bytes = 0
+    with stream:
+        for line in stream:
+            read_bytes += len(line.encode("utf-8", "ignore"))
+            if read_bytes > MAX_EVENTS_BYTES:
+                truncated = True
+                break
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            payload_type = event.get("payload_type") or event.get("type") or ""
+            payload = event.get("payload") or {}
+            if not isinstance(payload, dict):
+                payload = {}
+            text = payload.get("text") or event.get("text") or event.get("delta")
+            if payload_type == "run.output.delta" and isinstance(text, str):
+                deltas.append(text)
+            elif "output" in payload_type and isinstance(text, str):
+                fallback.append(text)
+            elif payload_type in ("run.completed", "run.result"):
+                for key in ("text", "result", "output"):
+                    value = payload.get(key)
+                    if isinstance(value, str) and value:
+                        fallback.append(value)
+                        break
+    return ("".join(deltas) or "".join(fallback)).strip(), truncated
+
+
+def sessions_root():
+    override = os.environ.get("CYCLOPS_SIDEVIEW_MUSE_SESSIONS")
+    if override:
+        return Path(override).expanduser()
+    xdg = os.environ.get("XDG_DATA_HOME")
+    base = Path(xdg).expanduser() if xdg else Path.home() / ".local" / "share"
+    return base / "muse" / "sessions"
+
+
+def session_ids_snapshot():
+    root = sessions_root()
+    try:
+        return {p.parent.name for p in root.glob("*/*/*/*/session.jsonl")}
+    except OSError:
+        return set()
+
+
+def make_receipt_dir(data_dir):
+    prune_receipts(data_dir)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    receipt = data_dir / "receipts" / f"{stamp}-{uuid.uuid4().hex[:8]}"
+    receipt.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        os.chmod(receipt, 0o700)
+    except OSError:
+        pass
+    return receipt
+
+
+def project_tips_path(data_dir, cwd):
+    """The tips log for one project, keyed by its resolved cwd.
+
+    Tips are per project, never global: a pane working in project A
+    must not display project B's side comments. The registry and
+    receipts stay global (they key sessions, not projects); only the
+    human-facing log is scoped. Margin computes the same path from
+    the builder's cwd — the contract test pins the scheme.
+    """
+    key = hashlib.sha256(str(Path(cwd).expanduser().resolve()).encode("utf-8")).hexdigest()[:16]
+    project_dir = Path(data_dir) / "projects" / key
+    try:
+        project_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        marker = project_dir / "project.txt"
+        if not marker.exists():
+            save(marker, str(Path(cwd).expanduser().resolve()) + "\n")
+    except OSError:
+        pass
+    return project_dir / "tips.md"
+
+
+def append_tip(tips_path, when, session_id, topic, result):
+    """Append one entry with a single O_APPEND write.
+
+    The topic is collapsed to one line and every result line is
+    `> `-prefixed, so neither the topic nor the model's own text can
+    forge a `## … · side session …` section header — the only lines
+    readers treat as entry boundaries are the ones written here.
+    One write(2) under O_APPEND means concurrent --once runs cannot
+    read-modify-rewrite each other's tips away.
+    """
+    tips_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    one_line_topic = " ".join((topic or "").split()) or "(the work in --cwd)"
+    body = "\n".join("> " + line if line else ">"
+                     for line in str(result).splitlines())
+    entry = (f"\n## {when} · side session {session_id}\n\n"
+             f"Watched: {one_line_topic}\n\n{body}\n")
+    # Rotation + append under one flock: concurrent runs at the
+    # rotation boundary cannot lose an entry or duplicate the header.
+    import fcntl
+    lock_fd = os.open(tips_path.with_name(tips_path.name + ".lock"),
+                      os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        try:
+            if tips_path.stat().st_size > 1024 * 1024:
+                os.replace(tips_path, tips_path.with_name(tips_path.name + ".1"))
+        except OSError:
+            pass
+        fd = os.open(tips_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            header = ("# Cyclops Sideview — tips log · format 1\n"
+                      if os.fstat(fd).st_size == 0 else "")
+            write_all(fd, (header + entry).encode("utf-8"))
+        finally:
+            os.close(fd)
+    finally:
+        os.close(lock_fd)
+
+
+def write_all(fd, data):
+    """Write every byte; a single os.write may legally write less."""
+    view = memoryview(data)
+    while view:
+        written = os.write(fd, view)
+        view = view[written:]
+
+
+def sync_pointer(data_dir):
+    """Keep active-data-dir.txt truthful for every launch.
+
+    Written for a custom dir, deleted at the default — on launch,
+    not only on success, so a failed default run cannot leave the
+    margin box stuck on a stale custom dir.
+    """
+    default_dir = default_data_dir()
+    resolved = Path(data_dir).expanduser().resolve()
+    pointer = default_dir / "active-data-dir.txt"
+    try:
+        default_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if resolved != default_dir.resolve():
+            save(pointer, str(resolved) + "\n")
+        else:
+            try:
+                pointer.unlink()
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+def register_side_session(session_id, data_dir):
+    """Record a side session id where Margin can cross-check it.
+
+    The registry lives in the *default* data dir even for custom
+    --data-dir runs, alongside a pointer to the active data dir — that
+    is what keeps the bridge connected when paths are customised.
+    Registration is what gives tips provenance: Margin displays only
+    entries whose session id is registered or receipted.
+    """
+    if not session_id:
+        return
+    default_dir = default_data_dir()
+    # Resolve before storing: a relative --data-dir must not leave a
+    # pointer that only means something from the launcher's cwd.
+    resolved = Path(data_dir).expanduser().resolve()
+    try:
+        default_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        prune_registry(default_dir)
+        fd = os.open(default_dir / "side-sessions.jsonl",
+                     os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            write_all(fd, (json.dumps(
+                {"id": str(session_id), "data_dir": str(resolved),
+                 "ts": utcnow()}) + "\n").encode("utf-8"))
+        finally:
+            os.close(fd)
+        sync_pointer(resolved)
+    except OSError:
+        pass  # registration is provenance, not a launch blocker
+
+
+def prune_registry(default_dir, keep_days=30, size_trigger=256 * 1024):
+    """Bound the registry: once large, drop entries older than keep_days.
+
+    Entries without a timestamp (written before ts existed) are kept
+    only while the file is small; the rewrite happens at most once
+    per size_trigger of growth.
+    """
+    registry = Path(default_dir) / "side-sessions.jsonl"
+    try:
+        if registry.stat().st_size <= size_trigger:
+            return
+        from datetime import timedelta
+        cutoff = datetime.now(timezone.utc) - timedelta(days=keep_days)
+        kept = []
+        for line in registry.read_text(encoding="utf-8", errors="replace").splitlines():
+            try:
+                row = json.loads(line)
+                ts = datetime.fromisoformat(str(row.get("ts", "")).replace("Z", "+00:00"))
+                if ts >= cutoff:
+                    kept.append(line)
+            except Exception:
+                continue
+        save(registry, "\n".join(kept) + ("\n" if kept else ""))
+    except OSError:
+        pass
+
+
+def prune_receipts(data_dir, keep_days=30):
+    """Drop receipt dirs older than keep_days (bounded scan cost)."""
+    import shutil
+    import time as _time
+    receipts = Path(data_dir) / "receipts"
+    try:
+        entries = list(receipts.iterdir())
+    except OSError:
+        return
+    cutoff = _time.time() - keep_days * 86400
+    for entry in entries:
+        try:
+            if entry.is_dir() and entry.stat().st_mtime < cutoff:
+                shutil.rmtree(entry, ignore_errors=True)
+        except OSError:
+            continue
+
+
+def warn_data_dir(data_dir):
+    if Path(data_dir).resolve() != default_data_dir().resolve():
+        print(f"{MARK}: note — custom --data-dir: tips land per project "
+              f"under {Path(data_dir) / 'projects'}; the margin pane follows "
+              "the registered pointer there, or set MARGIN_SIDEVIEW_TIPS "
+              "to the exact per-project tips.md",
+              file=sys.stderr)
+
+
+def append_live_note(tips_path, data_dir, topic, note, session_id="live"):
+    """Record that a live (tmux/interactive) side session opened.
+
+    A live session's words stay in its own pane and are never captured
+    here; this entry exists so the margin box shows a current, dated
+    pointer instead of a stale --once tip as if it were the live word.
+    """
+    # Register BEFORE appending: the pane renders ~4x/second, and an
+    # entry that lands before its provenance can be cached as
+    # unverified and hidden until the log changes again.
+    register_side_session(session_id, data_dir)
+    append_tip(tips_path, utcnow(), session_id, topic, note)
+
+
+def write_receipt(receipt, payload, prompt=None, prompt_stored=False):
+    save(receipt / "receipt.json", json.dumps(payload, indent=2) + "\n")
+    if prompt_stored and prompt is not None:
+        save(receipt / "prompt.txt", prompt)
+
+
+def run_once(args, prompt, evidence, cwd, data_dir):
+    session_id = str(uuid.uuid4())
+    receipt = make_receipt_dir(data_dir)
+    payload = {
+        "version": VERSION, "mode": "once", "created": utcnow(),
+        "side_session_id": session_id, "cwd": str(cwd),
+        "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+        "topic_first80": getattr(args, "topic_text", "")[:80], "evidence": evidence,
+        "allow_write": args.allow_write, "allow_shell": args.allow_shell,
+        "allow_web": getattr(args, "allow_web", False),
+        "status": "running", "receipt": str(receipt),
+    }
+    if args.prepare_only:
+        payload["status"] = "prepared"
+        payload["topic_first80"] = ""  # no prompt text at all, not even the topic
+        cmd = headless_command(args, session_id, receipt / "prompt.txt")
+        shown = [c if c != str(receipt / "prompt.txt") else "<prompt-file>" for c in cmd]
+        write_receipt(receipt, payload)  # no prompt text stored at all
+        print(f"{MARK}: prepared (no launch)")
+        print(f"  command: {' '.join(shown)}")
+        print(f"  receipt: {receipt}")
+        return 0
+    prompt_path = receipt / "prompt.txt"
+    write_receipt(receipt, payload, prompt=prompt, prompt_stored=True)
+    cmd = headless_command(args, session_id, prompt_path)
+    events_path = receipt / "native.events.jsonl"
+    try:
+        events_fd = os.open(events_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(events_fd, "wb") as events:
+            proc = subprocess.run(cmd, cwd=str(cwd), env=child_env(),
+                                  stdout=events, stderr=subprocess.PIPE,
+                                  timeout=args.timeout or None)
+        stderr_text = proc.stderr.decode("utf-8", errors="replace") if proc.stderr else ""
+    except subprocess.TimeoutExpired:
+        payload["status"] = "timeout"
+        write_receipt(receipt, payload, prompt=prompt, prompt_stored=True)
+        try:
+            prompt_path.unlink()
+        except OSError:
+            pass
+        raise UserError(f"side view timed out after {args.timeout}s; receipt: {receipt}") from None
+    except FileNotFoundError:
+        raise UserError(f"muse binary not found: {args.muse_bin}") from None
+    result, events_truncated = _extract_result(events_path)
+    # The child has finished with the prompt file; the receipt keeps
+    # only its hash and first-80 topic, so the person's exact words
+    # do not sit in a receipt indefinitely.
+    try:
+        prompt_path.unlink()
+    except OSError:
+        pass
+    if proc.returncode != 0:
+        payload["status"] = "failed"
+        write_receipt(receipt, payload)  # prompt file already deleted
+        tail = stderr_text.strip().splitlines()[-1] if stderr_text.strip() else ""
+        raise UserError(f"side view failed (exit {proc.returncode}){': ' + tail if tail else ''}; receipt: {receipt}")
+    if not result:
+        payload["status"] = "completed_no_output"
+        write_receipt(receipt, payload)  # prompt file already deleted
+        print(f"{MARK}: side view produced no readable output")
+        print(f"  receipt: {receipt}")
+        return 3
+    payload["status"] = "completed_truncated" if events_truncated else "completed"
+    payload["events_truncated"] = events_truncated
+    payload["completed"] = utcnow()  # tips are stamped at completion, not launch
+    if events_truncated:
+        result += ("\n\n◐ Sideview · (the run's event stream passed the "
+                   f"{MAX_EVENTS_BYTES // (1024 * 1024)} MiB cap — this tip may be truncated.)")
+    write_receipt(receipt, payload)  # prompt file already deleted
+    save(receipt / "result.txt", result + "\n")
+    # Register only now: a failed or timed-out run earns no provenance.
+    register_side_session(session_id, data_dir)
+    tips_path = project_tips_path(data_dir, cwd)
+    append_tip(tips_path, payload["completed"], session_id,
+               getattr(args, "topic_text", ""), result)
+    print(result)
+    print(f"{MARK}: tip above is also in the tips log — pass along what is useful")
+    print(f"  tips: {tips_path}")
+    print(f"  receipt: {receipt}")
+    print(f"  side session: {session_id}")
+    warn_data_dir(data_dir)
+    return 0
+
+
+def run_tmux(args, prompt, cwd, data_dir):
+    session_id = str(uuid.uuid4())
+    receipt = make_receipt_dir(data_dir)
+    inner = interactive_command(args)  # no prompt: it is pasted, never argv
+    # Set the nested marker in the pane's own shell environment: the tmux
+    # client's environment is not reliably passed through a running server.
+    shell_cmd = (f"{SIDEVIEW_ENV_MARKER}=1 "
+                 + " ".join(_shell_quote(p) for p in inner))
+    name = f"sideview-{session_id[:8]}"
+    env = child_env()
+    if os.environ.get("TMUX"):
+        cmd = ["tmux", "split-window", "-h", "-P", "-F", "#{pane_id}",
+               "-c", str(cwd), shell_cmd]
+        reach = "switch to the new tmux pane beside you (side view lives there)"
+    else:
+        cmd = ["tmux", "new-session", "-d", "-s", name, "-c", str(cwd), shell_cmd]
+        reach = f"attach with: tmux attach -t {name}"
+    payload = {
+        "version": VERSION, "mode": "tmux", "created": utcnow(),
+        "side_session_id": None, "cwd": str(cwd),
+        "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+        "topic_first80": getattr(args, "topic_text", "")[:80], "status": "launched",
+        "tmux_session": None if os.environ.get("TMUX") else name,
+        "receipt": str(receipt),
+    }
+    before_ids = session_ids_snapshot()
+    pane_id = None
+    try:
+        proc = subprocess.run(cmd, check=True, env=env, capture_output=True, text=True)
+        pane_id = (proc.stdout or "").strip() or None
+    except FileNotFoundError:
+        raise UserError("tmux not found on PATH") from None
+    except subprocess.CalledProcessError as exc:
+        write_receipt(receipt, {**payload, "status": "failed"})
+        raise UserError(f"tmux launch failed: {(exc.stderr or '').strip()}") from None
+    # Capture the pane's real session id: poll the session store for
+    # exactly one new log (FreshEye's interactive trick). The receipt
+    # and registry then name the real session, and Margin's id-based
+    # exclusion covers tmux side views without any heuristic.
+    real_id = None
+    try:
+        capture_secs = float(os.environ.get("CYCLOPS_SIDEVIEW_TMUX_CAPTURE_SECS", "15"))
+    except ValueError:
+        capture_secs = 15.0
+    if capture_secs > 0:
+        import time as _time
+        deadline = _time.time() + capture_secs
+        while _time.time() < deadline:
+            new_ids = session_ids_snapshot() - before_ids
+            if len(new_ids) == 1:
+                real_id = next(iter(new_ids))
+                break
+            if len(new_ids) > 1:
+                break  # ambiguous: register nothing rather than guess
+            _time.sleep(0.5)
+    if real_id:
+        payload["side_session_id"] = real_id
+        register_side_session(real_id, data_dir)
+    # Deliver the prompt by paste, never by argv (see deliver_tmux_prompt).
+    target = pane_id if os.environ.get("TMUX") else name
+    try:
+        deliver_tmux_prompt(target, prompt)
+    except Exception as exc:
+        write_receipt(receipt, {**payload, "status": "prompt_delivery_failed"})
+        raise UserError(f"side view opened but its prompt could not be delivered: {exc}") from None
+    write_receipt(receipt, payload)
+    append_live_note(project_tips_path(data_dir, cwd), data_dir,
+                     getattr(args, "topic_text", ""),
+                     "◐ Sideview · live side session opened — its comments are "
+                     "in the side pane (tmux), not in this log.",
+                     session_id=real_id or f"live-{session_id[:8]}")
+    print(f"{MARK}: side view open — its comments display in its own pane")
+    print(f"  reach it: {reach}")
+    print(f"  tips log: {project_tips_path(data_dir, cwd)} (a dated 'live session opened' pointer was appended)")
+    print(f"  receipt: {receipt}")
+    print("  this builder session is untouched; nothing is sent to it automatically")
+    warn_data_dir(data_dir)
+    return 0
+
+
+def _shell_quote(part):
+    return "'" + part.replace("'", "'\\''") + "'"
+
+
+def run_interactive(args, prompt, cwd, data_dir):
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        print(f"{MARK}: no terminal attached — running one headless tip instead",
+              file=sys.stderr)
+        args.once = True
+        return None  # caller falls through to run_once
+    receipt = make_receipt_dir(data_dir)
+    payload = {
+        "version": VERSION, "mode": "interactive", "created": utcnow(),
+        "side_session_id": None, "cwd": str(cwd),
+        "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+        "topic_first80": getattr(args, "topic_text", "")[:80], "status": "launched",
+        "receipt": str(receipt),
+    }
+    write_receipt(receipt, payload)
+    print(f"{MARK}: side view opening here — its comments display in this terminal")
+    print(f"  receipt: {receipt}")
+    warn_data_dir(data_dir)
+    cmd = interactive_command(args, prompt)
+    before = session_ids_snapshot()
+    try:
+        code = subprocess.call(cmd, cwd=str(cwd), env=child_env())
+    except FileNotFoundError:
+        raise UserError(f"muse binary not found: {args.muse_bin}") from None
+    # The interactive run has ended: if exactly one new session log
+    # appeared, it was the side view's — record its real id so Margin's
+    # adoption guard and tip provenance stop relying on heuristics.
+    new_ids = session_ids_snapshot() - before
+    real_id = next(iter(new_ids)) if len(new_ids) == 1 else None
+    if real_id:
+        payload["side_session_id"] = real_id
+        payload["status"] = "ended"
+        write_receipt(receipt, payload)
+        register_side_session(real_id, data_dir)
+    if code != 0:
+        payload["status"] = "failed"
+        write_receipt(receipt, payload)
+        if not real_id:
+            # No session ever appeared: nothing opened, so no note
+            # may claim it did.
+            return code
+    # Only now — the launch demonstrably happened — claim it opened.
+    append_live_note(project_tips_path(data_dir, cwd), data_dir,
+                     getattr(args, "topic_text", ""),
+                     "◐ Sideview · live side session opened — its comments are "
+                     "in its own terminal, not in this log.",
+                     session_id=real_id or f"live-{uuid.uuid4().hex[:8]}")
+    return code
+
+
+WATCH_EDIT_TOOLS = {"edit_file", "write_file", "apply_patch"}
+WATCH_FAILED = {"failed", "error", "failure"}
+
+
+def _record_of(event):
+    payload = event.get("payload") or {}
+    if not isinstance(payload, dict):
+        return {}
+    record = payload.get("record")
+    return record if isinstance(record, dict) else payload
+
+
+def _outcome_kind(record):
+    outcome = record.get("outcome") if isinstance(record, dict) else None
+    if isinstance(outcome, dict):
+        return str(outcome.get("kind") or outcome.get("status") or "")
+    return str(outcome or "")
+
+
+class Watcher:
+    """When a passive look is due (pure logic; the loop does the I/O).
+
+    Signals: a finished turn with edits, or a failed tool. Looks are
+    debounced (quiet period first), spaced (min interval), and capped
+    per hour — a passive arrangement must mostly be still.
+    """
+
+    def __init__(self, min_interval=180, cap=6, debounce=20):
+        self.min_interval = min_interval
+        self.cap = cap
+        self.debounce = debounce
+        self.edits = 0
+        self.edited_paths = []
+        self.failure = False
+        self.turn_ended = False
+        self.last_event_at = 0.0
+        self.last_look = 0.0
+        self.look_times = []
+        self._started = {}  # effect/call id -> tool name
+
+    def feed(self, event, now):
+        pt = event.get("payload_type") or ""
+        record = _record_of(event)
+        if pt == "tool_batch.effect.started":
+            # Terminal records carry no tool name; the host links them
+            # to their start by effect/call id (Margin's own lesson).
+            # The started record is also where the file subject lives
+            # (parallel_profile.subject, e.g. "workspace:src/a.py").
+            tool = record.get("tool_name")
+            if isinstance(tool, str):
+                profile = record.get("parallel_profile")
+                subject = profile.get("subject") if isinstance(profile, dict) else None
+                path = ""
+                if isinstance(subject, str) and subject:
+                    path = subject.split(":", 1)[-1] if ":" in subject else subject
+                for key in (record.get("effect_id"), record.get("call_id")):
+                    if key:
+                        self._started[str(key)] = (tool, path)
+            return
+        if pt == "tool_batch.effect.terminal":
+            tool = str(record.get("tool_name") or "")
+            subject_path = ""
+            # Always consume the started entry, even when the terminal
+            # carries its own tool name — otherwise it leaks and its
+            # edited path is lost.
+            for key in (record.get("effect_id"), record.get("call_id")):
+                if key and str(key) in self._started:
+                    started_tool, subject_path = self._started.pop(str(key))
+                    tool = tool or started_tool
+                    break
+            outcome = _outcome_kind(record).lower()
+            nested = ""
+            task_completion = record.get("outcome")
+            if isinstance(task_completion, dict):
+                terminal = task_completion.get("task_completion")
+                if isinstance(terminal, dict):
+                    inner = terminal.get("terminal")
+                    if isinstance(inner, dict):
+                        nested = str(inner.get("kind") or "").lower()
+            failed = ("fail" in outcome or "error" in outcome
+                      or nested in WATCH_FAILED)
+            if failed:
+                self.failure = True
+                self.last_event_at = now
+            elif tool in WATCH_EDIT_TOOLS:
+                # A failed edit is a failure, not an edit that landed.
+                self.edits += 1
+                self.last_event_at = now
+                if subject_path and subject_path not in self.edited_paths:
+                    self.edited_paths.append(subject_path)
+        elif pt == "runtime.session":
+            # The real turn-end signal (verified against builder logs;
+            # run.terminal.* appears in no real log): the host commits
+            # the assistant's message at payload.event.kind.
+            event = event.get("payload") or {}
+            inner = event.get("event") if isinstance(event, dict) else None
+            if isinstance(inner, dict) and inner.get("kind") == "assistant_message_committed":
+                self.turn_ended = True
+                self.last_event_at = now
+        elif pt in ("run.terminal.completed", "run.terminal.ended"):
+            self.turn_ended = True
+            self.last_event_at = now
+
+    def has_signal(self):
+        return self.failure or (self.turn_ended and self.edits > 0)
+
+    def due(self, now):
+        if not self.has_signal():
+            return False
+        if now - self.last_event_at < self.debounce:
+            return False
+        if self.last_look and now - self.last_look < self.min_interval:
+            return False
+        self.look_times = [t for t in self.look_times if now - t < 3600]
+        return len(self.look_times) < self.cap
+
+    def consume(self, now):
+        bits = []
+        if self.failure:
+            bits.append("a tool just failed")
+        if self.edits:
+            bits.append(f"{self.edits} edit(s) landed")
+        if self.turn_ended:
+            bits.append("a turn just ended")
+        topic = ("Passive side look — " + "; ".join(bits) +
+                 ". Leave a tip only if something is genuinely relevant from the side.")
+        paths = self.edited_paths[:5]
+        self.edits, self.edited_paths = 0, []
+        self.failure = self.turn_ended = False
+        self.last_look = now
+        self.look_times.append(now)
+        return topic, paths
+
+
+def known_side_ids():
+    ids = set()
+    for base in {default_data_dir()}:
+        try:
+            for line in (Path(base) / "side-sessions.jsonl").read_text(
+                    encoding="utf-8", errors="replace").splitlines():
+                try:
+                    sid = json.loads(line).get("id")
+                except Exception:
+                    continue
+                if sid:
+                    ids.add(str(sid))
+        except OSError:
+            pass
+        for path in Path(base).glob("receipts/*/receipt.json"):
+            try:
+                sid = json.loads(path.read_text(encoding="utf-8", errors="replace")).get("side_session_id")
+                if sid:
+                    ids.add(str(sid))
+            except Exception:
+                continue
+    return ids
+
+
+def newest_builder_log():
+    """Newest Muse session log that is not a Sideview session."""
+    root = sessions_root()
+    known = known_side_ids()
+    candidates = []
+    for path in root.glob("*/*/*/*/session.jsonl"):
+        if path.parent.name in known:
+            continue
+        try:
+            candidates.append((path.stat().st_mtime, path))
+        except OSError:
+            continue
+    if not candidates:
+        return None
+    candidates.sort()
+    return candidates[-1][1]
+
+
+def run_watch(args, cwd, data_dir):
+    import time as _time
+    watcher = Watcher(min_interval=args.watch_min_interval,
+                      cap=args.watch_cap, debounce=args.watch_debounce)
+    path, offset, carry = None, 0, ""
+    last_adopt = 0.0
+    current_done = False  # current log's turn ended and went quiet
+    print(f"{MARK}: watching passively — tips will pop up here and in the margin. Ctrl-C ends me.")
+    print(f"  spacing: at most one look per {args.watch_min_interval}s, "
+          f"{args.watch_cap}/hour, after {args.watch_debounce}s of quiet")
+    try:
+        while True:
+            now = _time.time()
+            if path is None or now - last_adopt > 10:
+                last_adopt = now
+                found = newest_builder_log()
+                # Adopt only at the start, or when the current session
+                # is done and quiet — never flap to whichever log was
+                # touched last, and always start at the tail: passive
+                # means watching what happens next, not re-reading
+                # history into fresh signals.
+                if found and found != path and (path is None or current_done):
+                    path = found
+                    try:
+                        offset = path.stat().st_size
+                    except OSError:
+                        offset = 0
+                    carry = ""
+                    current_done = False
+                    print(f"  · following builder session {path.parent.name}")
+            if path is not None:
+                try:
+                    with open(path, encoding="utf-8", errors="replace") as f:
+                        f.seek(offset)
+                        chunk = f.read()
+                        offset = f.tell()
+                except OSError:
+                    chunk = ""
+                if chunk:
+                    carry += chunk
+                    parts = carry.split("\n")
+                    carry = parts.pop()  # trailing partial line stays buffered
+                    for line in parts:
+                        line = line.strip()
+                        if not line.startswith("{"):
+                            continue
+                        try:
+                            event = json.loads(line)
+                        except Exception:
+                            continue
+                        # Session end is the adoption gate — tracked
+                        # here, not via watcher.turn_ended, because a
+                        # fired look consumes and clears that flag and
+                        # must not deadlock the next adoption.
+                        if event.get("payload_type") == "session.end":
+                            current_done = True
+                        try:
+                            watcher.feed(event, _time.time())
+                        except Exception:
+                            continue
+            if watcher.turn_ended and _time.time() - watcher.last_event_at > 30:
+                current_done = True
+            if watcher.due(_time.time()):
+                topic, paths = watcher.consume(_time.time())
+                args.topic_text = topic
+                evidence = []
+                for raw in paths:
+                    try:
+                        evidence.extend(validate_evidence([raw], cwd, False))
+                    except UserError:
+                        continue
+                prompt = build_prompt(topic, evidence)
+                print(f"{MARK}: a quiet moment with something to see — looking…")
+                try:
+                    run_once(args, prompt, evidence, cwd, data_dir)
+                except UserError as exc:
+                    print(f"{MARK}: look skipped: {exc}", file=sys.stderr)
+            _time.sleep(0.5)
+    except KeyboardInterrupt:
+        print(f"\n{MARK}: watch ended. The side view is quiet again.")
+        return 0
+
+
+def resolve_topic(args):
+    pieces = []
+    if args.prompt_file:
+        try:
+            pieces.append(Path(args.prompt_file).read_text(encoding="utf-8"))
+        except OSError as exc:
+            raise UserError(f"cannot read --prompt-file: {exc}") from None
+    if args.prompt_stdin:
+        pieces.append(sys.stdin.read())
+    if args.topic:
+        pieces.append(" ".join(args.topic))
+    topic = "\n".join(p.strip() for p in pieces if p and p.strip()).strip()
+    return topic
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(
+        prog="muse-sideview",
+        description="Open a passive Cyclops Sideview session beside the builder.")
+    p.add_argument("topic", nargs="*", help="what the side view should watch")
+    p.add_argument("--once", action="store_true", help="one headless tip, then exit")
+    p.add_argument("--tmux", action="store_true", help="open the side view in a tmux pane/session")
+    p.add_argument("--watch", action="store_true",
+                   help="passive mode: tail the builder session log and look on its own when work lands")
+    p.add_argument("--watch-min-interval", type=int, default=180,
+                   help="minimum seconds between passive looks (default 180)")
+    p.add_argument("--watch-cap", type=int, default=6,
+                   help="maximum passive looks per hour (default 6)")
+    p.add_argument("--watch-debounce", type=int, default=20,
+                   help="seconds of quiet before a passive look fires (default 20)")
+    p.add_argument("--prompt-file", help="read the topic from a file")
+    p.add_argument("--prompt-stdin", action="store_true", help="read the topic from stdin")
+    p.add_argument("--evidence", action="append", default=[], help="file the side view should read (repeatable)")
+    p.add_argument("--cwd", default=".", help="work directory to watch (default: .)")
+    p.add_argument("--data-dir", help="state dir (default: $CYCLOPS_SIDEVIEW_MUSE_DATA_DIR or XDG state)")
+    p.add_argument("--muse-bin", default=os.environ.get("CYCLOPS_SIDEVIEW_MUSE_BIN", "muse"))
+    p.add_argument("--model", help="model id for the side session")
+    p.add_argument("--allow-write", action="store_true",
+                   help="let the side session write/run (default: read-only tip-only)")
+    p.add_argument("--allow-shell", action="store_true",
+                   help="with read-only, still allow shell (e.g. git diff) in headless runs")
+    p.add_argument("--allow-web", action="store_true",
+                   help="with read-only, still allow web tools in headless runs")
+    p.add_argument("--allow-outside-evidence", action="store_true")
+    p.add_argument("--allow-nested", action="store_true",
+                   help="allow launching from inside a sideview session")
+    p.add_argument("--timeout", type=int, default=600, help="--once timeout seconds (0 = none)")
+    p.add_argument("--prepare-only", action="store_true",
+                   help="print a redacted command and receipt without launching")
+    p.add_argument("--version", action="version", version=f"muse-sideview {VERSION}")
+    args = p.parse_args(argv)
+
+    if os.environ.get(SIDEVIEW_ENV_MARKER) and not args.allow_nested:
+        print(f"{MARK}: already inside a sideview session — refusing to nest "
+              "(pass --allow-nested to override)", file=sys.stderr)
+        return 2
+    try:
+        if args.once and args.tmux:
+            raise UserError("--once and --tmux contradict each other; pass one")
+        if args.timeout < 0:
+            raise UserError("--timeout must be 0 (none) or a positive number of seconds")
+        if args.watch and (args.once or args.tmux):
+            raise UserError("--watch stands alone; pass it without --once/--tmux")
+        if args.watch and (args.topic or args.prompt_file or args.prompt_stdin
+                           or args.evidence or args.prepare_only):
+            raise UserError("--watch takes no topic, --prompt-file/--prompt-stdin, "
+                            "--evidence or --prepare-only; it decides its own looks")
+        if args.watch_min_interval < 0 or args.watch_cap < 1 or args.watch_debounce < 0:
+            raise UserError("--watch spacing values must be non-negative (and --watch-cap at least 1)")
+        topic = resolve_topic(args)
+        cwd = Path(args.cwd).expanduser().resolve()
+        if not cwd.is_dir():
+            raise UserError(f"--cwd is not a directory: {args.cwd}")
+        data_dir = Path(args.data_dir).expanduser() if args.data_dir else default_data_dir()
+        sync_pointer(data_dir)
+        evidence = validate_evidence(args.evidence, cwd, args.allow_outside_evidence)
+        prompt = build_prompt(topic, evidence)
+        args.topic_text = topic
+        if args.watch:
+            return run_watch(args, cwd, data_dir)
+        if args.tmux:
+            return run_tmux(args, prompt, cwd, data_dir)
+        if args.once:
+            return run_once(args, prompt, evidence, cwd, data_dir)
+        result = run_interactive(args, prompt, cwd, data_dir)
+        if result is None:  # no tty: fell back to headless
+            return run_once(args, prompt, evidence, cwd, data_dir)
+        return result
+    except UserError as exc:
+        print(f"{MARK}: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

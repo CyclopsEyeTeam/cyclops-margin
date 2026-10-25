@@ -151,7 +151,7 @@ if [ -n "${TMUX:-}" ]; then
       tmux_restore "$PREV_MOUSE" "$PREV_HIST"
       "$TMUX_BIN" kill-pane -t "$PANE_ID" 2>/dev/null || true
     }
-    trap cleanup EXIT INT TERM
+    trap cleanup EXIT INT TERM HUP
   else
     echo "│ ? margin pane could not open (window too small?) — Muse alone; your tmux session was left as found." >&2
     tmux_restore "$PREV_MOUSE" "$PREV_HIST"
@@ -189,20 +189,36 @@ for a in ${FILTERED_ARGS[@]+"${FILTERED_ARGS[@]}"}; do RUNNER_CMD="$RUNNER_CMD $
 
 # Every option below is scoped to our own session (-t). Server-wide
 # options are never touched, so the user's tmux server is left as found.
+# Stepwise (not one exec chain) so a split that cannot fit is reported
+# instead of silently yielding a marginless session.
+# Detached creation needs the real terminal size, or splits sized
+# for the user's window fail against tmux's 80x24 default. And
+# destroy-unattached must NOT be set yet: it destroys a session with
+# no client instantly, before attach ever happens.
+_SIZE=()
+[ -t 1 ] && _SIZE=(-x "$(tput cols 2>/dev/null || echo 80)" -y "$(tput lines 2>/dev/null || echo 24)")
+"$TMUX_BIN" new-session -d "${_SIZE[@]}" -s "$SESSION_NAME" "$RUNNER_CMD" || {
+  echo "│ ! could not create the tmux session — Muse not started." >&2
+  rm -f "$RUNNER" 2>/dev/null || true
+  exit 1
+}
+"$TMUX_BIN" set-option -t "$SESSION_NAME" mouse on 2>/dev/null || true
+"$TMUX_BIN" set-option -t "$SESSION_NAME" history-limit 50000 2>/dev/null || true
+"$TMUX_BIN" set-option -t "$SESSION_NAME" status "$STATUS_OPT" 2>/dev/null || true
 if [ "$LAYOUT" = "top" ]; then
-  exec "$TMUX_BIN" new-session -s "$SESSION_NAME" "$RUNNER_CMD" \; \
-    set-option -t "$SESSION_NAME" mouse on \; \
-    set-option -t "$SESSION_NAME" history-limit 50000 \; \
-    set-option -t "$SESSION_NAME" destroy-unattached on \; \
-    set-option -t "$SESSION_NAME" status "$STATUS_OPT" \; \
-    split-window -b -v -l "${MARGIN_HEIGHT:-16}" "$MARGIN_CMD" \; \
-    select-pane -D
+  if "$TMUX_BIN" split-window -b -v -l "${MARGIN_HEIGHT:-16}" -t "$SESSION_NAME" "$MARGIN_CMD" 2>/dev/null; then
+    "$TMUX_BIN" select-pane -D 2>/dev/null || true
+  else
+    echo "│ ? margin pane could not open (window too small?) — Muse alone in this session." >&2
+  fi
 else
-  exec "$TMUX_BIN" new-session -s "$SESSION_NAME" "$RUNNER_CMD" \; \
-    set-option -t "$SESSION_NAME" mouse on \; \
-    set-option -t "$SESSION_NAME" history-limit 50000 \; \
-    set-option -t "$SESSION_NAME" destroy-unattached on \; \
-    set-option -t "$SESSION_NAME" status "$STATUS_OPT" \; \
-    split-window -h -l "${MARGIN_WIDTH:-42}" "$MARGIN_CMD" \; \
-    select-pane -L
+  if "$TMUX_BIN" split-window -h -l "${MARGIN_WIDTH:-42}" -t "$SESSION_NAME" "$MARGIN_CMD" 2>/dev/null; then
+    "$TMUX_BIN" select-pane -L 2>/dev/null || true
+  else
+    echo "│ ? margin pane could not open (window too small?) — Muse alone in this session." >&2
+  fi
 fi
+# Arm destroy-unattached only once a client is attaching, so the
+# session dies on detach (as before) but never before first attach.
+( sleep 1; "$TMUX_BIN" set-option -t "$SESSION_NAME" destroy-unattached on 2>/dev/null || true ) &
+exec "$TMUX_BIN" attach-session -t "$SESSION_NAME"

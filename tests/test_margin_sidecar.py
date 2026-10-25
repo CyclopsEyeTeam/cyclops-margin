@@ -7,6 +7,7 @@ when stdout is not a TTY (the pane must not crash for lack of a
 terminal size).
 """
 import importlib.util, json, os, re, subprocess, sys, tempfile, time, unittest
+from pathlib import Path
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPT = os.path.join(ROOT, "sidecar", "margin.py")
@@ -283,7 +284,7 @@ class SecondSittingTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             tips = os.path.join(d, "tips.md")
             kept = os.path.join(d, "no-kept.txt")
-            m = mod.Margin(kept_path=kept, sideview_path=tips)
+            m = mod.Margin(kept_path=kept, sideview_path=tips, sideview_known_ids={"bbbb"}, sideview_installed=True)
             self.feed(m, "runtime.user_intent.accepted", {})
             # No tips log yet: no box, and nothing is invented.
             self.assertNotIn("from the side", plain(mod.render(m, 42, 44)))
@@ -298,7 +299,8 @@ class SecondSittingTest(unittest.TestCase):
                         "for the `shell` case ✓\x1b[31m now.\n")
             text = plain(mod.render(m, 42, 44))
             self.assertIn("from the side", text)
-            self.assertIn("check muse-sideview for", text)
+            self.assertIn("check muse-sideview:214", text)
+            self.assertIn("for the shell case", text)
             self.assertIn("the shell case", text)
             self.assertNotIn("the old tip nobody shows", text)
             # The side's text is data: cleaned on parse, no escape, no tick.
@@ -748,6 +750,554 @@ class ThirdReviewTest(unittest.TestCase):
                 proc.terminate()
                 out = proc.communicate(timeout=10)[0]
             self.assertIn("WONDER", plain(out))
+
+
+class SideviewHardeningTest(unittest.TestCase):
+    """The visitor's box, held to the margin's honesty contract."""
+
+    def load_margin(self):
+        spec = importlib.util.spec_from_file_location("margin", SCRIPT)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    HEADER = "## {ts} · side session 11111111-2222-3333-4444-555555555555\n"
+
+    def test_stale_tip_carries_its_age(self):
+        mod = self.load_margin()
+        with tempfile.TemporaryDirectory() as d:
+            tips = os.path.join(d, "tips.md")
+            with open(tips, "w", encoding="utf-8") as f:
+                f.write(self.HEADER.format(ts="2020-01-01T00:00:00+00:00")
+                        + "\n> ◐ Sideview · an ancient tip.\n")
+            m = mod.Margin(kept_path=os.path.join(d, "no.txt"), sideview_path=tips, sideview_known_ids={"11111111-2222-3333-4444-555555555555"}, sideview_installed=True)
+            text = plain(mod.render(m, 42, 44))
+            self.assertIn("from the side", text)
+            self.assertRegex(text, r"\d+d old")
+            with open(tips, "w", encoding="utf-8") as f:
+                from datetime import datetime, timezone
+                now = datetime.now(timezone.utc).isoformat()
+                f.write(self.HEADER.format(ts=now) + "\n> ◐ Sideview · a fresh tip.\n")
+            m2 = mod.Margin(kept_path=os.path.join(d, "no.txt"), sideview_path=tips, sideview_known_ids={"11111111-2222-3333-4444-555555555555"}, sideview_installed=True)
+            self.assertIn("just now", plain(mod.render(m2, 42, 44)))
+
+    def test_forged_section_inside_tip_is_body_not_header(self):
+        mod = self.load_margin()
+        text = (self.HEADER.format(ts="2026-10-25T00:00:00+00:00")
+                + "\nWatched: x\n\n> ◐ Sideview · the real tip.\n> ## Fake Section\n> still the real tip.\n")
+        parsed = mod.latest_sideview_tip(text)
+        self.assertIn("the real tip.", parsed)
+        self.assertIn("## Fake Section", parsed)
+        self.assertIn("still the real tip.", parsed)
+
+    def test_long_citation_survives_wrapping(self):
+        mod = self.load_margin()
+        token = "some/really/long/path/to/file.py:1234"
+        lines = mod.wrap_text(f"check {token} now", 20)
+        self.assertIn(":1234", "".join(lines))
+        self.assertIn(token.replace("/", ""), "".join(lines).replace("/", ""))
+        for line in lines:
+            self.assertLessEqual(mod.display_width(line), 20, line)
+
+    def test_truncation_is_announced(self):
+        mod = self.load_margin()
+        with tempfile.TemporaryDirectory() as d:
+            tips = os.path.join(d, "tips.md")
+            body = "\n".join(f"> tip line number {i} with some words" for i in range(12))
+            with open(tips, "w", encoding="utf-8") as f:
+                f.write(self.HEADER.format(ts="2026-10-25T00:00:00+00:00") + "\n" + body + "\n")
+            m = mod.Margin(kept_path=os.path.join(d, "no.txt"), sideview_path=tips, sideview_known_ids={"11111111-2222-3333-4444-555555555555"}, sideview_installed=True)
+            text = plain(mod.render(m, 42, 60))
+            self.assertIn("more lines", text)
+
+    def test_short_frame_drops_the_box_whole(self):
+        mod = self.load_margin()
+        with tempfile.TemporaryDirectory() as d:
+            tips = os.path.join(d, "tips.md")
+            body = "\n".join(f"> tip line {i}" for i in range(8))
+            with open(tips, "w", encoding="utf-8") as f:
+                f.write(self.HEADER.format(ts="2026-10-25T00:00:00+00:00") + "\n" + body + "\n")
+            m = mod.Margin(kept_path=os.path.join(d, "no.txt"), sideview_path=tips, sideview_known_ids={"11111111-2222-3333-4444-555555555555"}, sideview_installed=True)
+            m.feed(json.loads(rec("runtime.user_intent.accepted", {})))
+            text = plain(mod.render(m, 42, 22))
+            self.assertNotIn("from the side", text)  # no amputated border
+            self.assertNotIn("╰", text.split("annotations")[-1] if "annotations" in text else "")
+
+    def test_escape_debris_does_not_render(self):
+        mod = self.load_margin()
+        text = (self.HEADER.format(ts="2026-10-25T00:00:00+00:00")
+                + "\n> \x1b[31mRED\x1b[0m alert\n")
+        parsed = mod.latest_sideview_tip(text)
+        self.assertNotIn("[31m", parsed)
+        self.assertIn("RED", parsed)
+
+    def test_sideview_sessions_are_never_adopted(self):
+        mod = self.load_margin()
+        import unittest.mock as mock
+        with tempfile.TemporaryDirectory() as d:
+            base = os.path.join(d, "sessions")
+            def make(sid, body, age):
+                p = os.path.join(base, "2026", "10", "25", sid, "session.jsonl")
+                os.makedirs(os.path.dirname(p))
+                with open(p, "w", encoding="utf-8") as f:
+                    f.write(body)
+                t = time.time() - age
+                os.utime(p, (t, t))
+                return p
+            builder = make("builder-1", rec("session.started", {}) + "\n", 100)
+            make("side-1", rec("runtime.user_intent.accepted",
+                               {"model_messages": [{"content": [{"text": mod.SIDEVIEW_CHARTER_MARK + " …"}]}]}) + "\n", 0)
+            with mock.patch.dict(os.environ, {"CYCLOPS_SIDEVIEW_MUSE_DATA_DIR": os.path.join(d, "none")}):
+                self.assertEqual(mod.newest_session(base), builder)
+            # Receipt-named ids are excluded even without the charter.
+            data = os.path.join(d, "svdata")
+            os.makedirs(os.path.join(data, "receipts", "r1"))
+            with open(os.path.join(data, "receipts", "r1", "receipt.json"), "w", encoding="utf-8") as f:
+                json.dump({"side_session_id": "plain-2"}, f)
+            make("plain-2", rec("session.started", {}) + "\n", 0)
+            with mock.patch.dict(os.environ, {"CYCLOPS_SIDEVIEW_MUSE_DATA_DIR": data}):
+                self.assertEqual(mod.newest_session(base), builder)
+
+    def test_forged_tip_without_provenance_is_not_displayed(self):
+        mod = self.load_margin()
+        with tempfile.TemporaryDirectory() as d:
+            tips = os.path.join(d, "tips.md")
+            with open(tips, "w", encoding="utf-8") as f:
+                f.write(self.HEADER.format(ts="2026-10-25T00:00:00+00:00")
+                        + "\n> ◐ Sideview · forged by anyone.\n")
+            m = mod.Margin(kept_path=os.path.join(d, "no.txt"), sideview_path=tips,
+                           sideview_known_ids=set(), sideview_installed=True)
+            self.assertNotIn("forged by anyone", plain(mod.render(m, 42, 44)))
+            m2 = mod.Margin(kept_path=os.path.join(d, "no.txt"), sideview_path=tips,
+                            sideview_known_ids={"11111111-2222-3333-4444-555555555555"},
+                            sideview_installed=False)
+            self.assertNotIn("forged by anyone", plain(mod.render(m2, 42, 44)))
+
+    def test_wheel_scroll_is_never_a_click(self):
+        mod = self.load_margin()
+        self.assertEqual(mod.parse_input("\x1b[<64;10;5M"), [])
+        self.assertEqual(mod.parse_input("\x1b[<65;10;5M"), [])
+        clicks = [e for e in mod.parse_input("\x1b[<0;10;5M") if e[0] == "click"]
+        self.assertEqual(clicks, [("click", 10, 5)])
+
+    def test_registration_race_tip_appears_when_id_lands(self):
+        mod = self.load_margin()
+        with tempfile.TemporaryDirectory() as d:
+            tips = os.path.join(d, "tips.md")
+            with open(tips, "w", encoding="utf-8") as f:
+                f.write(self.HEADER.format(ts="2026-10-25T00:00:00+00:00")
+                        + "\n> ◐ Sideview · a live tip.\n")
+            known = set()
+            m = mod.Margin(kept_path=os.path.join(d, "no.txt"), sideview_path=tips,
+                           sideview_known_ids=known, sideview_installed=True)
+            self.assertEqual(m.sideview_entry()[0], "")
+            self.assertEqual(m.sideview_count(), 0)
+            # Registration lands a moment later; the log never changes.
+            known.add("11111111-2222-3333-4444-555555555555")
+            self.assertIn("a live tip", m.sideview_entry()[0])
+            self.assertEqual(m.sideview_count(), 1)
+
+    def test_charter_in_tool_result_is_not_a_side_session(self):
+        mod = self.load_margin()
+        with tempfile.TemporaryDirectory() as d:
+            base = os.path.join(d, "sessions")
+            def make(sid, rows):
+                p = os.path.join(base, "2026", "10", "25", sid, "session.jsonl")
+                os.makedirs(os.path.dirname(p))
+                with open(p, "w", encoding="utf-8") as f:
+                    f.write("\n".join(rows) + "\n")
+                return p
+            charter = mod.SIDEVIEW_CHARTER_MARK
+            builder = make("builder-9", [
+                rec("runtime.user_intent.accepted", {"text": "build the thing"}),
+                rec("tool_batch.effect.terminal",
+                    {"record": {"outcome": {"kind": "completed"}}, "text": charter}),
+            ])
+            self.assertFalse(mod.is_sideview_session(builder, known_ids=set()))
+            quoting = make("builder-10", [
+                rec("runtime.user_intent.accepted",
+                    {"text": f"please review this charter: {charter}"}),
+            ])
+            self.assertFalse(mod.is_sideview_session(quoting, known_ids=set()))
+            side = make("side-9", [
+                rec("session.started", {}),
+                rec("runtime.user_intent.accepted",
+                    {"model_messages": [{"content": [{"text": charter + " …"}]}]}),
+            ])
+            self.assertTrue(mod.is_sideview_session(side, known_ids=set()))
+
+    def test_running_pane_re_resolves_tips_path(self):
+        mod = self.load_margin()
+        import unittest.mock as mock
+        with tempfile.TemporaryDirectory() as d:
+            d1 = os.path.join(d, "state1"); d2 = os.path.join(d, "state2")
+            os.makedirs(d1); os.makedirs(d2)
+            hdr = self.HEADER.format(ts="2026-10-25T00:00:00+00:00")
+            with open(os.path.join(d2, "tips.md"), "w", encoding="utf-8") as f:
+                f.write(hdr + "\n> ◐ Sideview · tip from the custom dir.\n")
+            with open(os.path.join(d1, "tips.md"), "w", encoding="utf-8") as f:
+                f.write(hdr + "\n> ◐ Sideview · tip from the default dir.\n")
+            with open(os.path.join(d1, "active-data-dir.txt"), "w", encoding="utf-8") as f:
+                f.write(d2 + "\n")
+            env = {"CYCLOPS_SIDEVIEW_MUSE_DATA_DIR": d1}
+            known = {"11111111-2222-3333-4444-555555555555"}
+            with mock.patch.dict(os.environ, env):
+                m = mod.Margin(kept_path=os.path.join(d, "no.txt"),
+                               sideview_known_ids=known, sideview_installed=True)
+                text, _ = m.sideview_entry()
+                self.assertIn("custom dir", text)
+                os.unlink(os.path.join(d1, "active-data-dir.txt"))
+                text, _ = m.sideview_entry()
+                self.assertIn("default dir", text)
+
+    def test_oversized_entry_announces_instead_of_vanishing(self):
+        mod = self.load_margin()
+        with tempfile.TemporaryDirectory() as d:
+            tips = os.path.join(d, "tips.md")
+            with open(tips, "w", encoding="utf-8") as f:
+                f.write(self.HEADER.format(ts="2026-10-25T00:00:00+00:00") + "\n> " + "x" * (300 * 1024) + "\n")
+            m = mod.Margin(kept_path=os.path.join(d, "no.txt"), sideview_path=tips,
+                           sideview_known_ids={"11111111-2222-3333-4444-555555555555"},
+                           sideview_installed=True)
+            text, _ = m.sideview_entry()
+            self.assertIn("larger than the margin reads", text)
+
+
+class SideviewToggleTest(unittest.TestCase):
+    """The margin's second button: turn the visitor on and off."""
+
+    def load_margin(self):
+        spec = importlib.util.spec_from_file_location("margin", SCRIPT)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def fake_runner(self, calls, pane_alive=True):
+        class Proc:
+            def __init__(self, rc=0, out=""):
+                self.returncode, self.stdout = rc, out
+        def run(argv, **kw):
+            calls.append(argv)
+            if "split-window" in argv:
+                return Proc(0, "%99\n")
+            if "display-message" in argv:
+                return Proc(0 if pane_alive else 1, "%99\n" if pane_alive else "")
+            return Proc(0, "")
+        return run
+
+    def test_toggle_opens_then_closes_a_pane(self):
+        mod = self.load_margin()
+        import unittest.mock as mock
+        calls = []
+        m = mod.Margin(kept_path="/nonexistent-kept.txt",
+                       sideview_known_ids=set(), sideview_installed=True)
+        m.cwd = "/work/project"
+        fakebin_dir = tempfile.mkdtemp()
+        fakebin = os.path.join(fakebin_dir, "muse-sideview")
+        with open(fakebin, "w", encoding="utf-8") as f:
+            f.write("#!/bin/sh\n")
+        os.chmod(fakebin, 0o755)
+        with mock.patch.dict(os.environ, {"TMUX": "/tmp/fake,1,0",
+                                          "MARGIN_SIDEVIEW_BIN": fakebin}):
+            self.assertEqual(mod.toggle_sideview(m, runner=self.fake_runner(calls)), "on")
+            self.assertEqual(m.sideview_target, "%99")
+            split = [c for c in calls if "split-window" in c]
+            self.assertIn("/work/project", split[0])
+            self.assertIn("muse-sideview", split[0][-1])
+            self.assertNotIn("--watch", split[0][-1])  # the button opens the conversation
+            self.assertIn("Watch this work from the side", split[0][-1])
+            self.assertEqual(mod.toggle_sideview(m, runner=self.fake_runner(calls)), "off")
+            self.assertIsNone(m.sideview_target)
+            self.assertTrue(any("kill-pane" in c for c in calls))
+        # A toggle is a pane-local act: no marks, no tally.
+        self.assertEqual(m.marks, 0)
+        self.assertTrue(all(v == 0 for v in m.tally.values()))
+
+    def test_toggle_outside_tmux_uses_a_session(self):
+        mod = self.load_margin()
+        import unittest.mock as mock
+        calls = []
+        m = mod.Margin(kept_path="/nonexistent-kept.txt",
+                       sideview_known_ids=set(), sideview_installed=True)
+        fakebin_dir = tempfile.mkdtemp()
+        fakebin = os.path.join(fakebin_dir, "muse-sideview")
+        with open(fakebin, "w", encoding="utf-8") as f:
+            f.write("#!/bin/sh\n")
+        os.chmod(fakebin, 0o755)
+        env = dict(os.environ, MARGIN_SIDEVIEW_BIN=fakebin)
+        env.pop("TMUX", None)
+        with mock.patch.dict(os.environ, env, clear=False):
+            self.assertEqual(mod.toggle_sideview(m, runner=self.fake_runner(calls)), "on")
+            self.assertEqual(m.sideview_kind, "session")
+            self.assertTrue(any("new-session" in c for c in calls))
+
+    def test_toggle_without_sideview_installed_says_so(self):
+        mod = self.load_margin()
+        import unittest.mock as mock
+        m = mod.Margin(kept_path="/nonexistent-kept.txt",
+                       sideview_known_ids=set(), sideview_installed=True)
+        with mock.patch.dict(os.environ, {"MARGIN_SIDEVIEW_BIN": "/no/such/bin",
+                                          "HOME": "/nonexistent-home",
+                                          "PATH": "/nonexistent"}):
+            with mock.patch.object(mod.shutil, "which", return_value=None):
+                self.assertEqual(mod.toggle_sideview(m, runner=self.fake_runner([])), "missing")
+            self.assertIn("not found", m.side_feedback)
+
+    def test_dead_pane_reopens_instead_of_lying_on(self):
+        mod = self.load_margin()
+        import unittest.mock as mock
+        calls = []
+        m = mod.Margin(kept_path="/nonexistent-kept.txt",
+                       sideview_known_ids=set(), sideview_installed=True)
+        m.sideview_target, m.sideview_kind = "%42", "pane"
+        fakebin_dir = tempfile.mkdtemp()
+        fakebin = os.path.join(fakebin_dir, "muse-sideview")
+        with open(fakebin, "w", encoding="utf-8") as f:
+            f.write("#!/bin/sh\n")
+        os.chmod(fakebin, 0o755)
+        with mock.patch.dict(os.environ, {"TMUX": "/tmp/fake,1,0",
+                                          "MARGIN_SIDEVIEW_BIN": fakebin}):
+            result = mod.toggle_sideview(m, runner=self.fake_runner(calls, pane_alive=False))
+            self.assertEqual(result, "on")
+            self.assertEqual(m.sideview_target, "%99")
+
+    def test_button_renders_and_v_key_parses(self):
+        mod = self.load_margin()
+        m = mod.Margin(kept_path="/nonexistent-kept.txt",
+                       sideview_known_ids=set(), sideview_installed=True)
+        text = plain(mod.render(m, 42, 44))
+        self.assertIn("Open Side Review Conversation", text)
+        self.assertIsNotNone(m.side_button)
+        row, col0, col1 = m.side_button
+        self.assertTrue(mod.hit_side_button(m, col0 + 2, row + 1))
+        m.sideview_target = "%1"
+        self.assertIn("Side Review: open", plain(mod.render(m, 42, 44)))
+        self.assertIn(("sideview",), mod.parse_input("v"))
+        self.assertEqual(mod.parse_input("paste v text"), [])
+
+
+class SideLogToggleTest(unittest.TestCase):
+    """The third button: read every tip, not just the latest."""
+
+    def load_margin(self):
+        spec = importlib.util.spec_from_file_location("margin", SCRIPT)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    HEADER = "## 2026-10-25T0{i}:00:00+00:00 · side session sid-{i}\n"
+
+    def make(self, mod, d, n=5):
+        tips = os.path.join(d, "tips.md")
+        with open(tips, "w", encoding="utf-8") as f:
+            for i in range(n):
+                f.write(self.HEADER.format(i=i) + f"\n> ◐ Sideview · tip number {i}.\n\n")
+        m = mod.Margin(kept_path=os.path.join(d, "no.txt"), sideview_path=tips,
+                       sideview_known_ids={f"sid-{i}" for i in range(n)},
+                       sideview_installed=True)
+        return m, tips
+
+    def fake_runner(self, calls):
+        class Proc:
+            def __init__(self, rc=0, out=""):
+                self.returncode, self.stdout = rc, out
+        def run(argv, **kw):
+            calls.append(argv)
+            if "split-window" in argv:
+                return Proc(0, "%77\n")
+            if "display-message" in argv:
+                return Proc(0, "%77\n")
+            return Proc(0, "")
+        return run
+
+    def test_count_and_box_still_latest_only(self):
+        mod = self.load_margin()
+        with tempfile.TemporaryDirectory() as d:
+            m, _ = self.make(mod, d, 5)
+            self.assertEqual(m.sideview_count(), 5)
+            text, _ = m.sideview_entry()
+            self.assertIn("tip number 4", text)
+            frame = plain(mod.render(m, 48, 60))
+            self.assertIn("side log · 5", frame)
+            self.assertNotIn("tip number 3", frame)
+
+    def test_log_opens_pager_pane_then_closes(self):
+        mod = self.load_margin()
+        import unittest.mock as mock
+        with tempfile.TemporaryDirectory() as d:
+            m, tips = self.make(mod, d, 3)
+            calls = []
+            with mock.patch.dict(os.environ, {"TMUX": "/tmp/fake,1,0"}):
+                self.assertEqual(mod.toggle_side_log(m, runner=self.fake_runner(calls)), "open")
+                self.assertEqual(m.log_target, "%77")
+                split = [c for c in calls if "split-window" in c][0]
+                self.assertIn(tips, split[-1])
+                self.assertEqual(mod.toggle_side_log(m, runner=self.fake_runner(calls)), "closed")
+                self.assertIsNone(m.log_target)
+                self.assertTrue(any("kill-pane" in c for c in calls))
+
+    def test_log_with_no_tips_says_none_yet(self):
+        mod = self.load_margin()
+        with tempfile.TemporaryDirectory() as d:
+            m = mod.Margin(kept_path=os.path.join(d, "no.txt"),
+                           sideview_path=os.path.join(d, "absent.md"),
+                           sideview_known_ids=set(), sideview_installed=True)
+            self.assertEqual(mod.toggle_side_log(m, runner=self.fake_runner([])), "empty")
+            self.assertIn("none yet", m.log_feedback)
+            self.assertIn("side log · none yet", plain(mod.render(m, 42, 44)))
+
+    def test_log_button_geometry_and_l_key(self):
+        mod = self.load_margin()
+        with tempfile.TemporaryDirectory() as d:
+            m, _ = self.make(mod, d, 2)
+            plain(mod.render(m, 42, 44))
+            self.assertIsNotNone(m.log_button)
+            row, col0, col1 = m.log_button
+            self.assertTrue(mod.hit_log_button(m, col0 + 2, row + 1))
+            self.assertFalse(mod.hit_log_button(m, col0 + 2, row + 2))
+            self.assertIn(("sidelog",), mod.parse_input("l"))
+
+
+class SideviewIntegrationTest(unittest.TestCase):
+    """The real Sideview launcher's output through the real Margin parser."""
+
+    def test_launcher_tip_renders_in_margin(self):
+        root = os.path.dirname(ROOT)
+        launcher = os.path.join(ROOT, "muse-sideview")
+        if not os.path.exists(launcher):
+            self.skipTest("muse-sideview launcher not present")
+        spec = importlib.util.spec_from_file_location("margin", SCRIPT)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        with tempfile.TemporaryDirectory() as d:
+            fakebin = os.path.join(d, "bin"); os.makedirs(fakebin)
+            fake = os.path.join(fakebin, "muse")
+            with open(fake, "w", encoding="utf-8") as f:
+                f.write("#!/usr/bin/env python3\nimport json\n"
+                        "print(json.dumps({'payload_type': 'run.output.delta', 'payload': {'text': '◐ Sideview · integration tip: mind the seam.'}}))\n")
+            os.chmod(fake, 0o755)
+            work = os.path.join(d, "work"); os.makedirs(work)
+            state = os.path.join(d, "state")
+            env = dict(os.environ, PATH=f"{fakebin}:{os.environ.get('PATH', '')}")
+            env.pop("CYCLOPS_SIDEVIEW_SESSION", None)
+            env["XDG_STATE_HOME"] = os.path.join(d, "xdg-state")
+            proc = subprocess.run(
+                [sys.executable, launcher, "--once", "--data-dir", state,
+                 "--cwd", work, "watch the seam"],
+                capture_output=True, text=True, env=env, timeout=30)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            found = sorted(Path(state).glob("projects/*/tips.md"))
+            self.assertEqual(len(found), 1, found)
+            tips = str(found[0])
+            # Margin computes the identical per-project path from cwd.
+            self.assertEqual(tips, mod.project_tips_path(state, work))
+            with open(tips, encoding="utf-8") as f:
+                entry = mod.latest_sideview_entry(f.read())
+            self.assertIn("integration tip", entry["text"])
+            self.assertTrue(entry["session"])
+            m = mod.Margin(kept_path=os.path.join(d, "no.txt"), sideview_path=tips,
+                           sideview_known_ids={entry["session"]},
+                           sideview_installed=True)
+            frame = plain(mod.render(m, 48, 60))
+            self.assertIn("from the side · Sideview ·", frame)
+            self.assertIn("integration tip", frame)
+
+
+class SideviewOverrideAndCountTests(unittest.TestCase):
+    def load_margin(self):
+        spec = importlib.util.spec_from_file_location("margin", SCRIPT)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def _write(self, path, sess, text, when):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(f"\n## {when.isoformat()} · side session {sess}\n"
+                    "Watched: x\n" + "".join("> " + line + "\n" for line in text.splitlines()) + "\n")
+
+    def test_env_override_wins_over_per_project_resolution(self):
+        import datetime
+        import unittest.mock as mock
+        mod = self.load_margin()
+        now = datetime.datetime.now(datetime.timezone.utc)
+        with tempfile.TemporaryDirectory() as d:
+            state = os.path.join(d, "state")
+            cwd = os.path.join(d, "proj"); os.makedirs(cwd)
+            explicit = os.path.join(d, "my-explicit-tips.md")
+            self._write(explicit, "side-a", "explicit tip", now)
+            self._write(mod.project_tips_path(state, cwd), "side-a", "project tip", now)
+            env = {"CYCLOPS_SIDEVIEW_MUSE_DATA_DIR": state,
+                   "MARGIN_SIDEVIEW_TIPS": explicit}
+            with mock.patch.dict(os.environ, env):
+                m = mod.Margin(kept_path=os.path.join(d, "no.txt"),
+                               sideview_known_ids={"side-a"},
+                               sideview_installed=True)
+                m.cwd = cwd
+                self.assertEqual(m.sideview_entry()[0], "explicit tip")
+
+    def test_side_log_count_covers_the_whole_log(self):
+        import datetime
+        mod = self.load_margin()
+        now = datetime.datetime.now(datetime.timezone.utc)
+        with tempfile.TemporaryDirectory() as d:
+            tips = os.path.join(d, "tips.md")
+            with open(tips, "w", encoding="utf-8") as f:
+                for i in range(300):
+                    f.write(f"\n## {now.isoformat()} · side session side-a\n"
+                            "Watched: x\n> " + ("tip %d " % i) + ("x" * 1000) + "\n")
+            self.assertGreater(os.path.getsize(tips), mod.SIDEVIEW_TAIL_BYTES)
+            m = mod.Margin(kept_path=os.path.join(d, "no.txt"), sideview_path=tips,
+                           sideview_known_ids={"side-a"}, sideview_installed=True)
+            self.assertEqual(m.sideview_count(), 300)
+
+
+class MarginPerProjectTests(unittest.TestCase):
+    def load_margin(self):
+        spec = importlib.util.spec_from_file_location("margin", SCRIPT)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def _write(self, path, sess, text, when):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(f"\n## {when.isoformat()} · side session {sess}\n"
+                    "Watched: x\n" + "".join("> " + line + "\n" for line in text.splitlines()) + "\n")
+
+    def test_margin_shows_only_its_own_project_and_legacy_fallback(self):
+        import datetime
+        import unittest.mock as mock
+        mod = self.load_margin()
+        now = datetime.datetime.now(datetime.timezone.utc)
+        with tempfile.TemporaryDirectory() as d:
+            state = os.path.join(d, "state")
+            cwd_a, cwd_b = os.path.join(d, "a"), os.path.join(d, "b")
+            for c in (cwd_a, cwd_b):
+                os.makedirs(c)
+            self._write(mod.project_tips_path(state, cwd_a), "side-a", "tip for A", now)
+            self._write(mod.project_tips_path(state, cwd_b), "side-b", "tip for B", now)
+            self._write(os.path.join(state, "tips.md"), "side-a", "legacy global", now)
+            with mock.patch.dict(os.environ, {"CYCLOPS_SIDEVIEW_MUSE_DATA_DIR": state}):
+                m = mod.Margin(kept_path=os.path.join(d, "no.txt"),
+                               sideview_known_ids={"side-a", "side-b"},
+                               sideview_installed=True)
+                m.cwd = cwd_a
+                self.assertEqual(m.sideview_entry()[0], "tip for A")
+                self.assertNotIn("tip for B", plain(mod.render(m, 48, 60)))
+                # A project with no log of its own shows nothing —
+                # never another project's stale global word. The
+                # legacy log appears only before the cwd is known.
+                cwd_c = os.path.join(d, "c"); os.makedirs(cwd_c)
+                m.cwd = cwd_c
+                self.assertEqual(m.sideview_entry()[0], "")
+                self.assertEqual(m.sideview_count(), 0)
+                m.cwd = ""
+                self.assertEqual(m.sideview_entry()[0], "legacy global")
+                # Once that project gets its own log, it takes over.
+                m.cwd = cwd_c
+                self._write(mod.project_tips_path(state, cwd_c), "side-a", "tip for C", now)
+                self.assertEqual(m.sideview_entry()[0], "tip for C")
 
 
 if __name__ == "__main__":

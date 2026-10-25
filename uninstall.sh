@@ -62,8 +62,10 @@ remove_ours "$BIN_DIR/muse-margin" "$DIR/muse-margin"
 remove_ours "$BIN_DIR/muse-margintop" "$DIR/muse-margin"
 remove_ours "$BIN_DIR/margin-pane" "$DIR/margin-pane"
 remove_ours "$BIN_DIR/margin-keep" "$DIR/margin-keep"
+remove_ours "$BIN_DIR/muse-sideview" "$DIR/muse-sideview"
 say "· removed muse-margin links from $BIN_DIR (any that were Wonder's)"
 say "· your kept line, if any, stays at ~/.local/share/wonder-margin/kept.txt — it is yours, not mine to delete"
+say "· Sideview tips/receipts stay at ~/.local/state/cyclops-sideview-muse — yours, not mine to delete"
 
 SHIM_DIR="${HOME:-}/.local/share/wonder-margin/bin"
 if [ -L "$SHIM_DIR/muse" ]; then
@@ -74,9 +76,27 @@ if [ -L "$SHIM_DIR/muse" ]; then
   fi
 fi
 
-if command -v muse >/dev/null 2>&1 && muse plugins list --json 2>/dev/null | grep -q '"wonder-margin"'; then
+if ! command -v muse >/dev/null 2>&1; then
+  say "? muse not found — the plugin record was NOT removed; later: muse plugins remove wonder-margin"
+plugin_installed() { # structured check, never a substring grep
+  muse plugins list --json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+plugins = data.get("plugins", []) if isinstance(data, dict) else data
+for entry in plugins:
+    plugin = entry.get("plugin", entry) if isinstance(entry, dict) else {}
+    if plugin.get("id") == "wonder-margin" or plugin.get("name") == "wonder-margin":
+        sys.exit(0)
+sys.exit(1)'
+}
+elif plugin_installed; then
   muse plugins remove wonder-margin --json >/dev/null 2>&1 \
     && say "✓ plugin removed" || say "? plugin remove failed — try: muse plugins remove wonder-margin"
+else
+  say "· plugin was not installed"
 fi
 
 say "· Wonder has left the margin. The source folder was not touched."
