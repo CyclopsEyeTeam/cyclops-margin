@@ -75,11 +75,17 @@ class TmuxLauncherTest(unittest.TestCase):
             seen = ""
             for _ in range(40):
                 seen = tmux("capture-pane", "-p", "-t", f"{SESSION}:0.1").stdout
-                if "WONDER" in seen:
+                if "WONDER" in seen and "deadbeef" in seen:
                     break
                 time.sleep(0.25)
             self.assertIn("WONDER", seen)
             self.assertIn("in the margin", seen)
+            # The fake session's own id, not just any header: a pane
+            # that borrowed a real ~/.local/share/muse session would
+            # show WONDER too, and pass on a developer machine while
+            # failing in CI. That is exactly what a clean CI HOME
+            # exposed in the Case 2 test below.
+            self.assertIn("deadbeef", seen)
             main = tmux("capture-pane", "-p", "-t", f"{SESSION}:0.0").stdout
             self.assertIn("STUB-MUSE-RUNNING", main)
 
@@ -122,10 +128,19 @@ class TmuxLauncherTest(unittest.TestCase):
             seen = ""
             for _ in range(40):
                 seen = tmux("capture-pane", "-p", "-t", f"{dedicated}:0.1").stdout
-                if "WONDER" in seen:
+                if "WONDER" in seen and "deadbeef" in seen:
                     break
                 time.sleep(0.25)
             self.assertIn("WONDER", seen)
+            # The dedicated session is created detached, so without
+            # the launcher's explicit HOME forwarding (ENV_FWD in
+            # muse-margin) its panes would inherit the tmux server's
+            # HOME: on a developer machine the pane then found real
+            # session logs there and this test passed on borrowed
+            # logs, while CI's clean HOME left it waiting forever.
+            # Asserting the fake session id keeps the pass honest
+            # on both machines.
+            self.assertIn("deadbeef", seen)
             tmux("kill-session", "-t", dedicated)
 
 

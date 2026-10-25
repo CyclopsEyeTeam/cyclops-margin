@@ -91,7 +91,19 @@ case "$MUSE_BIN" in
     fi ;;
 esac
 
-MARGIN_CMD="$(printf '%q' "$MARGIN_PANE")"
+# tmux panes inherit the *session* environment, never this shell's: a
+# server started earlier (or a variable exported just for this launch)
+# would otherwise give the pane a stale HOME and silently drop every
+# MARGIN_*/XDG_* override. Forward what the sidecar actually reads —
+# via `env`, so no tmux-version or pane-shell syntax is involved.
+ENV_FWD=""
+for _v in HOME XDG_DATA_HOME XDG_STATE_HOME MARGIN_KEPT \
+          MARGIN_SIDEVIEW_TIPS MARGIN_SIDEVIEW_BIN \
+          CYCLOPS_SIDEVIEW_MUSE_DATA_DIR; do
+  [ -n "${!_v:-}" ] && ENV_FWD="$ENV_FWD $_v=$(printf '%q' "${!_v}")"
+done
+[ -n "$ENV_FWD" ] && ENV_FWD="env$ENV_FWD "
+MARGIN_CMD="${ENV_FWD}$(printf '%q' "$MARGIN_PANE")"
 
 # Non-interactive (piped, scripts, dumb terminal): pass straight through.
 # (${arr[@]+...} is the bash 3.2-safe empty-array expansion under `set -u`.)
@@ -184,7 +196,7 @@ STATUS_OPT="off"
 # tmux runs this string through the user's default shell, so name bash
 # explicitly: the %q quoting below is bash quoting, and dash/fish would
 # mis-parse it. The runner also gets $TMUX_BIN, never a bare `tmux`.
-RUNNER_CMD="bash $(printf '%q' "$RUNNER") $(printf '%q' "$MUSE_BIN") $(printf '%q' "$SESSION_NAME") $(printf '%q' "$RUNNER") $(printf '%q' "$TMUX_BIN")"
+RUNNER_CMD="${ENV_FWD}bash $(printf '%q' "$RUNNER") $(printf '%q' "$MUSE_BIN") $(printf '%q' "$SESSION_NAME") $(printf '%q' "$RUNNER") $(printf '%q' "$TMUX_BIN")"
 for a in ${FILTERED_ARGS[@]+"${FILTERED_ARGS[@]}"}; do RUNNER_CMD="$RUNNER_CMD $(printf '%q' "$a")"; done
 
 # Every option below is scoped to our own session (-t). Server-wide

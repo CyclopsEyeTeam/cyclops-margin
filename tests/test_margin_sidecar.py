@@ -1026,7 +1026,11 @@ class SideviewToggleTest(unittest.TestCase):
         os.chmod(fakebin, 0o755)
         env = dict(os.environ, MARGIN_SIDEVIEW_BIN=fakebin)
         env.pop("TMUX", None)
-        with mock.patch.dict(os.environ, env, clear=False):
+        # clear=True is what actually removes TMUX: patch.dict with
+        # clear=False never deletes keys missing from the new dict, so
+        # this test used to take the inside-tmux branch (and fail)
+        # whenever the suite itself ran inside tmux.
+        with mock.patch.dict(os.environ, env, clear=True):
             self.assertEqual(mod.toggle_sideview(m, runner=self.fake_runner(calls)), "on")
             self.assertEqual(m.sideview_kind, "session")
             self.assertTrue(any("new-session" in c for c in calls))
